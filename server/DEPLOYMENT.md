@@ -60,3 +60,23 @@ The custom domain is optional. Use the Render address first and configure a
 subdomain only after the game works. LiveKit live calls are a separate feature
 that is not implemented in this server release. Any future LiveKit secret
 must stay in Render's environment settings, never in the APK or repository.
+# Live Calls
+
+Save these values as private Render environment variables, not source files:
+
+- `LIVEKIT_URL`: your LiveKit project's secure WebSocket URL.
+- `LIVEKIT_API_KEY`: the project's server API key.
+- `LIVEKIT_API_SECRET`: the matching secret.
+
+The `/health` response shows `liveCalls: true` only when all three are set.
+Calls use LiveKit directly for audio; Render only issues short-lived,
+microphone-only tokens to connected game-room members. No camera or recording
+feature is enabled. The pinned official LiveKit browser client runs inside the
+Android app's audio WebView. Calls end when leaving the game or backgrounding
+the app. Voice notes remain independent and the live microphone is muted before
+recording a note. Actual two-phone audio must be tested after configuration.
+
+Offline Trump's rules and bot runner are also packaged into the Android APK.
+It makes no network requests. Server-only CI skips the local APK mirror check,
+but still runs complete offline-engine games for all seat counts and bot levels.
+
