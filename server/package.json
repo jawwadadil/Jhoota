@@ -1,0 +1,15 @@
+{
+  "name": "bluff-online-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/*.test.js && npm run smoke:deep",
+    "smoke": "node scripts/smoke-online.mjs",
+    "smoke:deep": "node scripts/run-deep-smoke.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
