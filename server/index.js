@@ -1,6 +1,8 @@
 import { WebSocketServer } from "ws";
 import http from "http";
 import os from "os";
+import { readFileSync } from "node:fs";
+import { liveCallConfigured, liveCallCredentials } from "./live-call.js";
 import { beginTrump, chooseTrump, playTrump, trumpPublicState, trumpSeatError, chooseBotTrump, chooseBotTrumpCard } from "./trump.js";
 
 const PORT = process.env.PORT || 8080;
@@ -20,6 +22,14 @@ const MAX_VOICE_AUDIO_BYTES = 180_000;
 const MAX_VOICE_BASE64_CHARS = Math.ceil(MAX_VOICE_AUDIO_BYTES / 3) * 4;
 
 const httpServer = http.createServer((request, response) => {
+  if (request.url === '/call' || request.url === '/call-client.js') {
+    const file = request.url === '/call' ? 'call.html' : 'call-client.js';
+    response.writeHead(200, { 'content-type': file.endsWith('.html') ? 'text/html; charset=utf-8' : 'text/javascript; charset=utf-8',
+      'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+      'content-security-policy': "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; connect-src https: wss:; media-src blob:; frame-ancestors 'none'",
+      'permissions-policy': 'microphone=(self), camera=()' });
+    response.end(readFileSync(new URL(file, import.meta.url))); return;
+  }
   const stats = serverStats();
   if (request.url === "/health") {
     return json(response, {
@@ -34,6 +44,7 @@ const httpServer = http.createServer((request, response) => {
       avatarProfiles: AVATAR_COUNT,
       gameTypes: ["bluff", "trump"],
       voiceClips: true,
+      liveCalls: liveCallConfigured(),
       maxVoiceDurationMs: MAX_VOICE_DURATION_MS,
       urls: localServerUrls(),
       network: `http://127.0.0.1:${PORT}/network`,
@@ -214,6 +225,14 @@ function handle(socket, message) {
   if (message.type === "sticker") return sticker(room, socket.playerId, message.value || "Nice try!");
   if (message.type === "chat") return chat(room, socket.playerId, message.value || "");
   if (message.type === "voice") return voice(room, socket.playerId, message.data, message.durationMs);
+  if (message.type === 'liveCallToken') {
+    const player = room.players.find(p => p.id === socket.playerId && p.socket === socket);
+    if (!player) return send(socket, { type: 'liveCallError', message: 'Rejoin your game room first.' });
+    if (player.lastCallTokenAt && Date.now() - player.lastCallTokenAt < 3000) return send(socket, { type: 'liveCallError', message: 'Wait a moment before retrying the call.' });
+    player.lastCallTokenAt = Date.now();
+    try { return send(socket, { type: 'liveCallToken', roomId: room.id, ...liveCallCredentials(room, player) }); }
+    catch (error) { return send(socket, { type: 'liveCallError', message: error.message }); }
+  }
   if (message.type === "endRoom") return endRoom(room, socket.playerId);
   if (message.type === "leave") return leaveRoom(room, socket);
 }
@@ -821,6 +840,7 @@ function stateFor(room, viewer) {
     allReady: readiness.allReady,
     maxPlayers: 8,
     voiceClips: true,
+    liveCalls: liveCallConfigured(),
     maxVoiceDurationMs: MAX_VOICE_DURATION_MS,
     totalKnownCards,
     serverProtocol: SERVER_PROTOCOL,
@@ -1178,6 +1198,7 @@ function roomSummary(room) {
     minimumOpeningCards: room.minimumOpeningCards,
     centerCount: room.centerPile.length,
     voiceClips: true,
+    liveCalls: liveCallConfigured(),
     maxVoiceDurationMs: MAX_VOICE_DURATION_MS,
     totalKnownCards: room.gameType === "trump" ? trumpPublicState(room, {}).totalKnownCards : totalKnownCards,
     deckOk: room.gameType === "trump" ? trumpPublicState(room, {}).deckOk : totalKnownCards === 52,
