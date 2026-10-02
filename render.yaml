@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: jhoota-online-server
+    runtime: node
+    plan: free
+    buildCommand: cd server && npm ci
+    startCommand: cd server && npm start
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
