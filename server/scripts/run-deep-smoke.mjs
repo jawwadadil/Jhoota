@@ -11,6 +11,9 @@ const server = spawn(process.execPath, ["index.js"], {
     PORT: port,
     HOST: "127.0.0.1",
     ENABLE_TEST_COMMANDS: "1",
+    LIVEKIT_URL: 'wss://test.livekit.cloud',
+    LIVEKIT_API_KEY: 'test-key-not-real',
+    LIVEKIT_API_SECRET: 'test-secret-not-real',
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -27,6 +30,7 @@ try {
   await waitForHealth();
   await runSmoke("scripts/smoke-online.mjs");
   await runSmoke("scripts/smoke-trump.mjs");
+  await runSmoke("scripts/smoke-call.mjs");
 } finally {
   server.kill();
 }
