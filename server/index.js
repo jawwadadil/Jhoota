@@ -3,7 +3,7 @@ import http from "http";
 import os from "os";
 import { readFileSync } from "node:fs";
 import { liveCallConfigured, liveCallCredentials } from "./live-call.js";
-import { beginTrump, chooseTrump, playTrump, trumpPublicState, trumpSeatError, chooseBotTrump, chooseBotTrumpCard } from "./trump.js";
+import { beginTrump, chooseTrump, playTrump, trumpPublicState, trumpSeatError, chooseBotTrump, chooseBotTrumpCard, advanceTrump, extendTrumpTurn, TURN_MS, EXTENSION_MS } from "./trump.js";
 
 const PORT = process.env.PORT || 8080;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -37,6 +37,7 @@ const httpServer = http.createServer((request, response) => {
       name: SERVER_NAME,
       serverProtocol: SERVER_PROTOCOL,
       serverBuild: SERVER_BUILD,
+      rulesRevision: 103,
       heartbeatMs: HEARTBEAT_MS,
       roomTtlMinutes: Math.round(ROOM_TTL_MS / 60000),
       uptimeSeconds: Math.floor(process.uptime()),
@@ -125,7 +126,24 @@ const heartbeatTimer = setInterval(() => {
   }
 }, HEARTBEAT_MS);
 
-server.on("close", () => clearInterval(heartbeatTimer));
+const turnTimer = setInterval(() => {
+  const now = Date.now();
+  for (const room of rooms.values()) {
+    if (!room.started || room.winner) continue;
+    if (!room.players.some(p => !p.isBot && p.connected)) continue;
+    if (room.gameType === 'trump') {
+      if (advanceTrump(room, now)) { broadcast(room); runBots(room); }
+    } else {
+      syncBluffDeadline(room, now);
+      if (now >= room.turnDeadline) {
+        room.log.push(`${currentPlayer(room).name}'s turn timed out. Automatic pass.`);
+        pass(room, currentPlayer(room).id);
+      }
+    }
+  }
+}, 250);
+
+server.on("close", () => { clearInterval(heartbeatTimer); clearInterval(turnTimer); });
 
 let shuttingDown = false;
 function shutdown(signal) {
@@ -133,6 +151,7 @@ function shutdown(signal) {
   shuttingDown = true;
   console.log(`${signal} received. Closing Jhoota connections.`);
   clearInterval(heartbeatTimer);
+  clearInterval(turnTimer);
   for (const socket of server.clients) {
     socket.close(1012, "server restarting");
   }
@@ -183,8 +202,8 @@ server.on("connection", (socket) => {
 
 
 function handle(socket, message) {
-  if (message.type === "create") return createRoom(socket, message.name, message.avatarIndex, message.appVersion, message.gameType);
-  if (message.type === "join") return joinRoom(socket, message.roomId, message.name, message.avatarIndex, message.reconnectToken, message.appVersion);
+  if (message.type === "create") return createRoom(socket, message.name, message.avatarIndex, message.appVersion, message.gameType, message.appBuild, message.requireTrumpOpened);
+  if (message.type === "join") return joinRoom(socket, message.roomId, message.name, message.avatarIndex, message.reconnectToken, message.appVersion, message.appBuild);
 
   const room = rooms.get(socket.roomId);
   if (!room) return send(socket, { type: "error", message: "Join a room first." });
@@ -193,6 +212,26 @@ function handle(socket, message) {
   }
 
   if (message.type === "start") return startGame(room, socket.playerId);
+  if (message.type === 'setTrumpLeadRule') {
+    if (room.gameType !== 'trump' || socket.playerId !== room.hostId || room.started && !room.winner || typeof message.enabled !== 'boolean') return sendToPlayer(room, socket.playerId, 'Only the host can change Trump rules in the lobby.');
+    room.requireTrumpOpened = message.enabled;
+    room.players.forEach(p => { if (!p.isBot) p.ready = false; });
+    room.log.push(`Trump leading rule ${message.enabled ? 'enabled' : 'disabled'} for the next game.`);
+    return broadcast(room);
+  }
+  if (message.type === 'extendTurn') {
+    let error = '';
+    if (room.gameType === 'trump') error = extendTrumpTurn(room, socket.playerId);
+    else {
+      syncBluffDeadline(room, Date.now());
+      const player = currentPlayer(room);
+      if (!room.started || room.winner || room.turnDeadline <= Date.now() || player.id !== socket.playerId || player.isBot) error = 'Only the current human player can extend an active turn.';
+      else if (room.turnExtensions.includes(player.id)) error = 'Your extra time has already been used this game.';
+      else { room.turnExtensions.push(player.id); room.turnDeadline += EXTENSION_MS; room.log.push(`${player.name} added 15 seconds to their turn.`); }
+    }
+    if (error) return sendToPlayer(room, socket.playerId, error);
+    return broadcast(room);
+  }
   if (message.type === "restartRound") return restartRound(room, socket.playerId);
   if (message.type === "addBot") return addBot(room, socket.playerId, message.difficulty || "Low");
   if (message.type === "fillBots") return fillBots(room, socket.playerId, message.target || 4, message.difficulty || "Low");
@@ -237,11 +276,12 @@ function handle(socket, message) {
   if (message.type === "leave") return leaveRoom(room, socket);
 }
 
-function createRoom(socket, name, avatarIndex, appVersion, gameType) {
+function createRoom(socket, name, avatarIndex, appVersion, gameType, appBuild, requireTrumpOpened) {
   if (gameType && !["bluff", "trump"].includes(gameType)) return send(socket, { type: "error", message: "Choose Bluff or Trump." });
   const roomId = makeRoomId();
   const player = makePlayer(name || "Host", true, appVersion, avatarIndex);
   player.team = gameType === "trump" ? 0 : null;
+  player.appBuild = Number.isSafeInteger(appBuild) ? appBuild : 0;
   player.ready = false;
   const room = {
     id: roomId,
@@ -249,6 +289,7 @@ function createRoom(socket, name, avatarIndex, appVersion, gameType) {
     hostId: player.id,
     players: [player],
     started: false,
+    requireTrumpOpened: requireTrumpOpened === true, turnExtensions: [],
     activeRank: null,
     currentIndex: 0,
     centerPile: [],
@@ -272,7 +313,7 @@ function createRoom(socket, name, avatarIndex, appVersion, gameType) {
   broadcast(room);
 }
 
-function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion) {
+function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion, appBuild) {
   const room = rooms.get(String(roomId || "").trim().toUpperCase());
   if (!room) {
     return send(socket, {
@@ -282,11 +323,13 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion)
     });
   }
   const requestedName = cleanName(name, "Player");
+  if (room.gameType === 'trump' && room.started && !room.winner && !(Number.isSafeInteger(appBuild) && appBuild >= 103)) return send(socket, { type: 'error', message: 'Install Jhoota build 103 or newer to rejoin this Trump game.' });
   const returning = room.players.find((player) => !player.isBot && player.reconnectToken && player.reconnectToken === reconnectToken)
     || room.players.find((player) => !player.isBot && !player.connected && samePlayerName(player.name, requestedName));
   if (returning) {
     returning.name = uniquePlayerName(room, cleanName(name, returning.name), returning.id);
     returning.appVersion = cleanVersion(appVersion);
+    returning.appBuild = Number.isSafeInteger(appBuild) ? appBuild : 0;
     returning.avatarIndex = cleanAvatarIndex(avatarIndex, returning.name);
     if (!room.started || room.winner) returning.ready = false;
     if (returning.socket?.readyState === 1 && returning.socket !== socket) {
@@ -313,6 +356,7 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion)
     avatarIndex,
   );
   player.ready = false;
+  player.appBuild = Number.isSafeInteger(appBuild) ? appBuild : 0;
   if (room.gameType === "trump") player.team = nextTrumpTeam(room);
   room.players.push(player);
   room.log.push(`${player.name} joined.`);
@@ -388,6 +432,7 @@ function changeTrumpTeams(room, playerId, message) {
     room.log.push(`${player.name} joined Team ${team === 0 ? 'A' : 'B'}.`);
   }
   room.players.forEach(p => { if (!p.isBot) p.ready = false; });
+  room.teamsChanged = true;
   broadcast(room);
 }
 
@@ -501,6 +546,7 @@ function startGame(room, playerId, forceRestart = false) {
   const unsupportedVersions = unsupportedHumanVersions(versions);
   if (versions.length > 1) return sendToPlayer(room, playerId, `All players must install the same APK version before start. Found: ${versions.join(" / ")}`);
   if (unsupportedVersions.length > 0) return sendToPlayer(room, playerId, `Install the latest APK v${SERVER_BUILD} before start. Found: ${unsupportedVersions.join(" / ")}`);
+  if (outdatedTrumpClients(room)) return sendToPlayer(room, playerId, 'Every phone needs Jhoota build 103 or newer for the balanced Trump rules.');
   let readiness = roomReadiness(room);
   const canHostAutoReady = !room.winner && hostCanAutoReady(room, playerId);
   if (!forceRestart && !readiness.allReady && canHostAutoReady) {
@@ -517,6 +563,9 @@ function startGame(room, playerId, forceRestart = false) {
   }
   room.started = true;
   room.roundNumber = (room.roundNumber || 0) + 1;
+  room.matchId = `${room.id}-${Date.now()}-${room.roundNumber}`;
+  room.matchPlayerIds = room.players.map(p => p.id);
+  room.turnExtensions = [];
   room.winner = null;
   room.winnerId = null;
   room.activeRank = null;
@@ -793,11 +842,19 @@ function testSetup(room, playerId, message) {
 
 function broadcast(room) {
   room.updatedAt = Date.now();
+  if (room.gameType !== 'trump') syncBluffDeadline(room, room.updatedAt);
   for (const player of room.players) {
     if (player.socket?.readyState === 1) {
       send(player.socket, { type: "state", state: stateFor(room, player) });
     }
   }
+}
+
+function syncBluffDeadline(room, now) {
+  if (!room.started || room.winner) { room.turnDeadline = 0; room.turnKey = ''; return; }
+  const key = [room.roundNumber, room.currentIndex, room.activeRank, room.centerPile.length,
+    currentPlayer(room).hand.length, room.consecutivePasses, room.lastBluffResult].join('|');
+  if (key !== room.turnKey) { room.turnKey = key; room.turnDeadline = now + TURN_MS; }
 }
 
 function stateFor(room, viewer) {
@@ -816,6 +873,7 @@ function stateFor(room, viewer) {
   const canStart = room.hostId === viewer.id && (!room.started || Boolean(room.winner)) && room.players.length >= 2
     && (room.gameType !== "trump" || !trumpSeatError(room.players.length))
     && (room.gameType !== "trump" || trumpTeamsEqual(room))
+    && !outdatedTrumpClients(room)
     && !versionMismatch
     && (readiness.allReady || (!room.winner && hostCanAutoReady(room, viewer.id)));
   return {
@@ -828,8 +886,14 @@ function stateFor(room, viewer) {
     minimumOpeningCards: room.minimumOpeningCards,
     phase: room.winner ? "Round over" : room.started ? "Playing" : "Lobby",
     botSpeedMs: room.botSpeedMs || 650,
+    turnDeadline: room.turnDeadline || 0, serverTime: Date.now(), turnDurationMs: TURN_MS,
+    turnDirection: 'anticlockwise',
+    extensionUsed: room.turnExtensions.includes(viewer.id),
+    canExtendTurn: Boolean(room.started && !room.winner && currentPlayer(room).id === viewer.id && !viewer.isBot && room.turnDeadline > Date.now() && !room.turnExtensions.includes(viewer.id)),
     deckOk: totalKnownCards === 52,
     roundNumber: room.roundNumber || 0,
+    matchId: room.matchId || '',
+    matchPlayerIds: room.matchPlayerIds || [],
     playerCount: room.players.length,
     connectedCount,
     offlineHumanCount,
@@ -845,6 +909,7 @@ function stateFor(room, viewer) {
     totalKnownCards,
     serverProtocol: SERVER_PROTOCOL,
     serverBuild: SERVER_BUILD,
+    rulesRevision: 103,
     versionMismatch,
     versionWarning: versionMismatch ? humanVersions.join(" / ") : "",
     serverVersionMismatch: unsupportedVersions.length > 0,
@@ -878,6 +943,7 @@ function stateFor(room, viewer) {
       isBot: Boolean(player.isBot),
       difficulty: player.difficulty || "",
       appVersion: player.isBot ? "" : player.appVersion || "old",
+      appBuild: player.appBuild || 0,
       wins: player.wins || 0,
       ready: Boolean(player.ready || player.isBot),
       team: room.gameType === "trump" ? player.team : null,
@@ -903,6 +969,7 @@ function startBlockReasonFor(room, viewer, readiness, humanVersions, versionMism
   const unsupportedVersions = unsupportedHumanVersions(humanVersions);
   if (humanVersions.length > 1) return `All phones need the same APK version. Found: ${humanVersions.join(" / ")}. Install the latest APK, then use Check Room.`;
   if (unsupportedVersions.length > 0) return `This server needs APK v${SERVER_BUILD}. Found: ${unsupportedVersions.join(" / ")}. Install the latest APK, then use Check Room.`;
+  if (outdatedTrumpClients(room)) return 'Every phone needs Jhoota build 103 or newer for the balanced Trump rules.';
   if (offlineHumans.length > 0) {
     return `Offline seat blocking start: ${offlineHumans.map((player) => player.name).join(", ")}. Host can Kick Offline or Bot Offline, then Check Room.`;
   }
@@ -928,6 +995,10 @@ function roomReadiness(room) {
     readyCount: readyHumans.length,
     allReady: humans.length > 0 && readyHumans.length === humans.length,
   };
+}
+
+function outdatedTrumpClients(room) {
+  return room.gameType === 'trump' && room.players.some(p => !p.isBot && !(p.appBuild >= 103));
 }
 
 function humanVersionSet(room) {
@@ -957,9 +1028,11 @@ function runBots(room) {
   clearTimeout(room.botTimer);
   room.botTimer = setTimeout(() => {
     if (!room.started || room.winner) return;
+    if (!room.players.some(p => !p.isBot && p.connected)) return;
     const bot = currentPlayer(room);
     if (!bot?.isBot) return;
     if (room.gameType === "trump") {
+      if (!['choose', 'play'].includes(room.trump.phase)) return;
       const error = room.trump.phase === "choose"
         ? chooseTrump(room, bot.id, chooseBotTrump(bot))
         : playTrump(room, bot.id, [chooseBotTrumpCard(room, bot)]);
@@ -1166,6 +1239,7 @@ function roomSummary(room) {
     && room.players.length >= 2
     && (room.gameType !== "trump" || !trumpSeatError(room.players.length) && trumpTeamsEqual(room))
     && Boolean(host?.connected)
+    && !outdatedTrumpClients(room)
     && !versionMismatch
     && readiness.allReady;
   const totalKnownCards = room.centerPile.length + room.players.reduce((total, player) => total + player.hand.length, 0);
@@ -1236,6 +1310,7 @@ function roomSummaryStartBlockReason(room, readiness, humanVersions, versionMism
   const unsupportedVersions = unsupportedHumanVersions(humanVersions);
   if (humanVersions.length > 1) return `All phones need the same APK version. Found: ${humanVersions.join(" / ")}.`;
   if (unsupportedVersions.length > 0) return `This server needs APK v${SERVER_BUILD}. Found: ${unsupportedVersions.join(" / ")}.`;
+  if (outdatedTrumpClients(room)) return 'Every phone needs Jhoota build 103 or newer for the balanced Trump rules.';
   if (offlineHumans.length > 0) return `Offline seat blocking start: ${offlineHumans.map((player) => player.name).join(", ")}.`;
   if (!readiness.allReady && unreadyHumans.length > 0) return `Waiting for ready: ${unreadyHumans.map((player) => player.name).join(", ")}.`;
   if (!readiness.allReady) return room.winner ? "Everyone must ready up again before rematch." : "All human players must ready up.";

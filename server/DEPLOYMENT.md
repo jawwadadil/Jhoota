@@ -29,13 +29,14 @@ Open `https://jhoota-online-server.onrender.com/health`. The JSON must show:
 {
   "ok": true,
   "serverBuild": "0.95",
+  "rulesRevision": 103,
   "serverProtocol": 7,
   "gameTypes": ["bluff", "trump"]
 }
 ```
 
 The Android server address is `wss://jhoota-online-server.onrender.com`.
-Every phone must install version 0.95. A Render loading page is not a passing
+Every phone should install Android build 103 of version 0.95 for balanced decks and immediate hand results. A Render loading page is not a passing
 health check. Wait for successful JSON and inspect Render's deployment logs
 if loading does not finish.
 
@@ -57,8 +58,7 @@ with 4/6/8 players, rematches, chosen teams, shuffled teams, and bot balancing.
 ## Later Setup
 
 The custom domain is optional. Use the Render address first and configure a
-subdomain only after the game works. LiveKit live calls are a separate feature
-that is not implemented in this server release. Any future LiveKit secret
+subdomain only after the game works. LiveKit live calls are enabled when configured. Any LiveKit secret
 must stay in Render's environment settings, never in the APK or repository.
 # Live Calls
 
@@ -79,4 +79,52 @@ recording a note. Actual two-phone audio must be tested after configuration.
 Offline Trump's rules and bot runner are also packaged into the Android APK.
 It makes no network requests. Server-only CI skips the local APK mirror check,
 but still runs complete offline-engine games for all seat counts and bot levels.
+
+## Rules Revision 101
+
+- First-game toss is visible for three seconds; the caller sees five cards.
+- Same teams: a previous winner calls next, rotating between teammates.
+- Changed teams or a drawn game: fresh toss.
+- Four seats: 52 cards, 13 each. Revision 103 replaces the former full-double decks:
+- Six seats: 72 cards, 12 each (standard 52 plus a second copy of 2-6 per suit).
+- Eight seats: 80 cards, 10 each (standard 52 plus a second copy of 2-8 per suit).
+- A/K/Q/J/10/9 remain one per suit. Card copies have unique identities.
+- Identical highest cards tie in favour of the first played copy.
+- A completed hand has a three-second reveal with all final cards visible.
+- No play is accepted during toss/reveal; after reveal the centre clears.
+- Turn and trump-selection timeouts are server-controlled at 30 seconds.
+- Trump timeout selects a legal card; Bluff timeout passes.
+- New profiles record only completed games the player participated in.
+- Older Trump APKs are blocked from starting the incompatible two-deck rules.
+
+Deploy this server update before testing these rules online. Existing rooms
+are lost on redeployment. Leave the existing LiveKit environment variables
+unchanged, and confirm `rulesRevision: 103` in `/health` after deployment.
+
+## Results Revision 102
+
+Player hand totals and a hand-by-hand winner history are counted by the shared
+online/offline Trump engine. Totals reset for each new game and preserve the
+teams that actually played, even after the lobby teams are changed. Only public
+winner information is included; no private hands or reserved cards are exposed.
+Build 102 presents these counts in a persistent victory screen. Close and
+Play Again are explicit actions; room messages do not dismiss the result.
+
+## Balanced Rules Revision 103
+
+Hand winners, scores and gold markers appear immediately on the last play.
+Actual played cards remain visible for three seconds before collection; the
+next 30-second turn starts only after collection. Final results wait for the
+last reveal. Win targets are 7/13, 7/12 and 6/10 for 4/6/8 seats; even ties draw.
+
+Leading trump stays unrestricted by default. The host can enable
+`requireTrumpOpened` in the lobby; then a trump lead requires a previously
+played trump, except when holding only trump. Following suit always applies.
+Changes reset human readiness and cannot affect an ongoing game.
+
+`extendTurn` adds 15 seconds for the current human once per game, including
+trump selection. Reveals, expired turns and bot turns cannot be extended.
+Chat and call activity do not reset deadlines. Rematches reset the extension.
+Android build 103 is required for all human Trump clients. Server revision 103
+must be deployed before online testing; an APK alone does not update Render.
 
