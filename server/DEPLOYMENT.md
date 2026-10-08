@@ -29,14 +29,14 @@ Open `https://jhoota-online-server.onrender.com/health`. The JSON must show:
 {
   "ok": true,
   "serverBuild": "0.95",
-  "rulesRevision": 103,
+  "rulesRevision": 106,
   "serverProtocol": 7,
   "gameTypes": ["bluff", "trump"]
 }
 ```
 
 The Android server address is `wss://jhoota-online-server.onrender.com`.
-Every phone should install Android build 103 of version 0.95 for balanced decks and immediate hand results. A Render loading page is not a passing
+Every phone should install Android build 106 of version 0.95 for shared bot/nearby rules, saved seats and game-night series. A Render loading page is not a passing
 health check. Wait for successful JSON and inspect Render's deployment logs
 if loading does not finish.
 
@@ -54,6 +54,12 @@ npm test
 
 Tests include existing Bluff regressions, Trump rules, full multiplayer games
 with 4/6/8 players, rematches, chosen teams, shuffled teams, and bot balancing.
+Session scores and best-of-three/five series are server-authoritative. Seat
+recovery requires the phone's private saved token; a matching name cannot
+take over someone else's hand. Rooms remain in memory on Render, so a server
+restart ends active online rooms. Nearby rooms run on the host phone instead
+and do not use Render or LiveKit. The phone bundle is generated from these
+same room rules and tested in the private Android workspace.
 
 ## Later Setup
 

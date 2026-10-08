@@ -2,6 +2,8 @@ import { WebSocketServer } from "ws";
 import http from "http";
 import os from "os";
 import { readFileSync } from "node:fs";
+import { randomUUID } from 'node:crypto';
+import { setSeries, beginSeriesGame, recordNightResult, gameNightState } from './game-night.js';
 import { liveCallConfigured, liveCallCredentials } from "./live-call.js";
 import { beginTrump, chooseTrump, playTrump, trumpPublicState, trumpSeatError, takeTrumpBotTurn, callTrumpToss, selectTrumpCaller, reviewTrumpHand, requestTrumpRedeal, catchTrumpCheat, advanceTrump, extendTrumpTurn, TURN_MS, EXTENSION_MS } from "./trump.js";
 
@@ -37,7 +39,7 @@ const httpServer = http.createServer((request, response) => {
       name: SERVER_NAME,
       serverProtocol: SERVER_PROTOCOL,
       serverBuild: SERVER_BUILD,
-      rulesRevision: 105,
+      rulesRevision: 106,
       heartbeatMs: HEARTBEAT_MS,
       roomTtlMinutes: Math.round(ROOM_TTL_MS / 60000),
       uptimeSeconds: Math.floor(process.uptime()),
@@ -183,20 +185,7 @@ server.on("connection", (socket) => {
     if (!socket.roomId || !socket.playerId) return;
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    const player = room.players.find((item) => item.id === socket.playerId);
-    const activeSocket = Boolean(player && player.socket === socket);
-    if (player && player.socket === socket) {
-      player.connected = false;
-      player.socket = null;
-    }
-    if (activeSocket && room.hostId === socket.playerId) {
-      const nextHost = room.players.find((item) => !item.isBot && item.connected);
-      if (nextHost) {
-        room.hostId = nextHost.id;
-        room.log.push(`${nextHost.name} is now host.`);
-      }
-    }
-    if (activeSocket) broadcast(room);
+    disconnectPlayer(room, socket);
   });
 });
 
@@ -207,6 +196,11 @@ function handle(socket, message) {
 
   const room = rooms.get(socket.roomId);
   if (!room) return send(socket, { type: "error", message: "Join a room first." });
+  if (message.type === 'setSeries') {
+    const error = setSeries(room, socket.playerId, message.length);
+    if (error) return sendToPlayer(room, socket.playerId, error);
+    return broadcast(room);
+  }
   if (room.gameType === "trump" && ["pass", "bluff", "setOpeningCards", "testSetup"].includes(message.type)) {
     return sendToPlayer(room, socket.playerId, "That action belongs to Bluff, not Trump.");
   }
@@ -299,6 +293,7 @@ function createRoom(socket, name, avatarIndex, appVersion, gameType, appBuild, r
   player.ready = false;
   const room = {
     id: roomId,
+    nightId: randomUUID(),
     gameType: gameType === "trump" ? "trump" : "bluff",
     hostId: player.id,
     players: [player],
@@ -338,8 +333,7 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion,
   }
   const requestedName = cleanName(name, "Player");
   if (room.gameType === 'trump' && room.started && !room.winner && !(Number.isSafeInteger(appBuild) && appBuild >= 105)) return send(socket, { type: 'error', message: 'Install Jhoota build 105 or newer to rejoin this Trump game.' });
-  const returning = room.players.find((player) => !player.isBot && player.reconnectToken && player.reconnectToken === reconnectToken)
-    || room.players.find((player) => !player.isBot && !player.connected && samePlayerName(player.name, requestedName));
+  const returning = room.players.find((player) => !player.isBot && player.reconnectToken && player.reconnectToken === reconnectToken);
   if (returning) {
     returning.name = uniquePlayerName(room, cleanName(name, returning.name), returning.id);
     returning.appVersion = cleanVersion(appVersion);
@@ -359,7 +353,7 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion,
   if (room.started) {
     return send(socket, {
       type: "error",
-      message: "Game already started. If this is your seat, enter the same name you used before. Otherwise ask the host to use Bot Offline or Restart Round.",
+      message: "Game already started. Use Rejoin Friends on the same phone to restore your saved seat. Otherwise ask the host to use Bot Offline or Restart Round.",
     });
   }
   if (room.players.length >= 8) return send(socket, { type: "error", message: "Room is full." });
@@ -441,6 +435,10 @@ function changeTrumpTeams(room, playerId, message) {
     if (![0, 1].includes(team)) return sendToPlayer(room, playerId, "Choose Team A or Team B.");
     const player = room.players.find(p => p.id === playerId);
     if (!player) return;
+    if (room.players.filter(p => !p.isBot).length === 1 && player.team !== team) {
+      const partner = room.players.find(p => p.isBot && p.team === team);
+      if (partner) partner.team = player.team;
+    }
     // Temporary unequal sides let a full room exchange teammates; start still requires equal teams.
     player.team = team;
     room.log.push(`${player.name} joined Team ${team === 0 ? 'A' : 'B'}.`);
@@ -575,6 +573,7 @@ function startGame(room, playerId, forceRestart = false) {
     const reason = room.winner ? "All connected human players must ready up again before rematch." : "All connected human players must be ready before start.";
     return sendToPlayer(room, playerId, reason);
   }
+  beginSeriesGame(room);
   room.started = true;
   room.roundNumber = (room.roundNumber || 0) + 1;
   room.matchId = `${room.id}-${Date.now()}-${room.roundNumber}`;
@@ -855,6 +854,7 @@ function testSetup(room, playerId, message) {
 }
 
 function broadcast(room) {
+  recordNightResult(room);
   room.updatedAt = Date.now();
   if (room.gameType !== 'trump') syncBluffDeadline(room, room.updatedAt);
   for (const player of room.players) {
@@ -923,7 +923,8 @@ function stateFor(room, viewer) {
     totalKnownCards,
     serverProtocol: SERVER_PROTOCOL,
     serverBuild: SERVER_BUILD,
-    rulesRevision: 105,
+    rulesRevision: 106,
+    ...gameNightState(room),
     versionMismatch,
     versionWarning: versionMismatch ? humanVersions.join(" / ") : "",
     serverVersionMismatch: unsupportedVersions.length > 0,
@@ -954,6 +955,7 @@ function stateFor(room, viewer) {
       avatarIndex: player.avatarIndex,
       cardCount: player.hand.length,
       connected: player.connected,
+      connectionStatus: player.connected ? room.started && !room.winner && currentPlayer(room).id === player.id ? 'thinking' : 'connected' : Date.now() < (player.reconnectingUntil || 0) ? 'reconnecting' : 'disconnected',
       isBot: Boolean(player.isBot),
       difficulty: player.difficulty || "",
       appVersion: player.isBot ? "" : player.appVersion || "old",
@@ -999,6 +1001,23 @@ function attach(socket, room, player) {
   socket.playerId = player.id;
   player.socket = socket;
   player.connected = true;
+  player.reconnectingUntil = 0;
+}
+
+function disconnectPlayer(room, socket) {
+  const player = room.players.find(p => p.id === socket.playerId && p.socket === socket);
+  if (!player) return;
+  player.connected = false; player.socket = null;
+  player.reconnectingUntil = Date.now() + 15000;
+  if (room.started && !room.winner && currentPlayer(room).id === player.id) {
+    if (room.trump?.deadline) room.trump.deadline = Math.max(room.trump.deadline, player.reconnectingUntil);
+    else if (room.turnDeadline) room.turnDeadline = Math.max(room.turnDeadline, player.reconnectingUntil);
+  }
+  if (room.hostId === player.id) {
+    const next = room.players.find(p => !p.isBot && p.connected);
+    if (next) { room.hostId = next.id; room.log.push(`${next.name} is now host.`); }
+  }
+  broadcast(room);
 }
 
 function roomReadiness(room) {
@@ -1193,8 +1212,8 @@ function makeRoomId() {
 function makePlayer(name, host, appVersion, avatarIndex) {
   const cleanPlayerName = cleanName(name, host ? "Host" : "Player");
   return {
-    id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-    reconnectToken: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 14)}`,
+    id: randomUUID(),
+    reconnectToken: randomUUID(),
     name: cleanPlayerName,
     avatarIndex: cleanAvatarIndex(avatarIndex, cleanPlayerName),
     appVersion: cleanVersion(appVersion),

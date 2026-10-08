@@ -443,7 +443,11 @@ async function runNameFallbackReconnectScenario() {
 
     await fallbackReturn.connect();
     fallbackReturn.send({ type: "join", roomId: created.roomId, name: " lost   phone ", appVersion: expectedServerBuild });
-    await fallbackReturn.waitFor(() => fallbackReturn.messages.some((message) => message.type === "joined"), "fallback same-name rejoin");
+    await fallbackReturn.waitFor(() => fallbackReturn.messages.some((message) => message.type === "error"), "same-name seat takeover refused");
+    if (fallbackReturn.messages.some(message => message.type === "joined")) throw new Error("Name-only reconnect exposed a private hand.");
+    const originalSeat = fallbackGuest.messages.find(message => message.type === "joined");
+    fallbackReturn.send({ type: "join", roomId: created.roomId, name: "Lost Phone", reconnectToken: originalSeat.reconnectToken, appVersion: expectedServerBuild });
+    await fallbackReturn.waitFor(() => fallbackReturn.messages.some((message) => message.type === "joined"), "saved-token rejoin");
     await fallbackHost.waitFor(() => fallbackHost.state?.players?.some((player) => player.name.toLowerCase() === "lost phone" && player.connected), "fallback restored seat visible");
     if (!fallbackReturn.state?.started || fallbackReturn.state.hand.length !== originalHandCount) {
       throw new Error("Same-name fallback reconnect did not restore the offline hand.");
@@ -486,7 +490,7 @@ async function runRunningRoomJoinMessageScenario() {
     lateGuest.send({ type: "join", roomId: created.roomId, name: "Different Friend", appVersion: expectedServerBuild });
     await lateGuest.waitFor(() => lateGuest.messages.some((message) => message.type === "error"), "late guest refused");
     const error = lateGuest.messages.find((message) => message.type === "error")?.message || "";
-    if (!error.includes("same name") || !error.includes("Bot Offline") || !error.includes("Restart Round")) {
+    if (!error.includes("Rejoin Friends") || !error.includes("Bot Offline") || !error.includes("Restart Round")) {
       throw new Error(`Running-room join error is not actionable: ${error}`);
     }
 
