@@ -3,7 +3,7 @@ import http from "http";
 import os from "os";
 import { readFileSync } from "node:fs";
 import { liveCallConfigured, liveCallCredentials } from "./live-call.js";
-import { beginTrump, chooseTrump, playTrump, trumpPublicState, trumpSeatError, chooseBotTrump, chooseBotTrumpCard, advanceTrump, extendTrumpTurn, TURN_MS, EXTENSION_MS } from "./trump.js";
+import { beginTrump, chooseTrump, playTrump, trumpPublicState, trumpSeatError, takeTrumpBotTurn, callTrumpToss, selectTrumpCaller, reviewTrumpHand, requestTrumpRedeal, catchTrumpCheat, advanceTrump, extendTrumpTurn, TURN_MS, EXTENSION_MS } from "./trump.js";
 
 const PORT = process.env.PORT || 8080;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -37,7 +37,7 @@ const httpServer = http.createServer((request, response) => {
       name: SERVER_NAME,
       serverProtocol: SERVER_PROTOCOL,
       serverBuild: SERVER_BUILD,
-      rulesRevision: 103,
+      rulesRevision: 105,
       heartbeatMs: HEARTBEAT_MS,
       roomTtlMinutes: Math.round(ROOM_TTL_MS / 60000),
       uptimeSeconds: Math.floor(process.uptime()),
@@ -212,6 +212,20 @@ function handle(socket, message) {
   }
 
   if (message.type === "start") return startGame(room, socket.playerId);
+  if (message.type === 'setCheatingRule') {
+    if (room.gameType !== 'trump' || socket.playerId !== room.hostId || room.started && !room.winner || typeof message.enabled !== 'boolean') return sendToPlayer(room, socket.playerId, 'Only the host can change rules in the lobby.');
+    room.cheatingAllowed = message.enabled;
+    room.players.forEach(p => { if (!p.isBot) p.ready = false; });
+    room.log.push(`Hidden-card cheating ${message.enabled ? 'enabled' : 'disabled'} for the next game.`);
+    return broadcast(room);
+  }
+  const trumpActions = { trumpToss: () => callTrumpToss(room, socket.playerId, message.choice), selectTrumpCaller: () => selectTrumpCaller(room, socket.playerId, message.callerId), reviewTrumpHand: () => reviewTrumpHand(room, socket.playerId), requestTrumpRedeal: () => requestTrumpRedeal(room, socket.playerId), catchTrumpCheat: () => catchTrumpCheat(room, socket.playerId, message.targetId) };
+  if (Object.hasOwn(trumpActions, message.type)) {
+    if (room.gameType !== 'trump') return sendToPlayer(room, socket.playerId, 'This action belongs to Trump.');
+    const error = trumpActions[message.type]();
+    if (error) return sendToPlayer(room, socket.playerId, error);
+    broadcast(room); return runBots(room);
+  }
   if (message.type === 'setTrumpLeadRule') {
     if (room.gameType !== 'trump' || socket.playerId !== room.hostId || room.started && !room.winner || typeof message.enabled !== 'boolean') return sendToPlayer(room, socket.playerId, 'Only the host can change Trump rules in the lobby.');
     room.requireTrumpOpened = message.enabled;
@@ -252,7 +266,7 @@ function handle(socket, message) {
     return runBots(room);
   }
   if (room.gameType === "trump" && message.type === "play") {
-    const error = playTrump(room, socket.playerId, message.cards);
+    const error = playTrump(room, socket.playerId, message.cards, Date.now(), typeof message.hideCard === 'string' ? message.hideCard : '');
     if (error) return sendToPlayer(room, socket.playerId, error);
     broadcast(room);
     return runBots(room);
@@ -289,7 +303,7 @@ function createRoom(socket, name, avatarIndex, appVersion, gameType, appBuild, r
     hostId: player.id,
     players: [player],
     started: false,
-    requireTrumpOpened: requireTrumpOpened === true, turnExtensions: [],
+    requireTrumpOpened: requireTrumpOpened === true, cheatingAllowed: false, turnExtensions: [],
     activeRank: null,
     currentIndex: 0,
     centerPile: [],
@@ -323,7 +337,7 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion,
     });
   }
   const requestedName = cleanName(name, "Player");
-  if (room.gameType === 'trump' && room.started && !room.winner && !(Number.isSafeInteger(appBuild) && appBuild >= 103)) return send(socket, { type: 'error', message: 'Install Jhoota build 103 or newer to rejoin this Trump game.' });
+  if (room.gameType === 'trump' && room.started && !room.winner && !(Number.isSafeInteger(appBuild) && appBuild >= 105)) return send(socket, { type: 'error', message: 'Install Jhoota build 105 or newer to rejoin this Trump game.' });
   const returning = room.players.find((player) => !player.isBot && player.reconnectToken && player.reconnectToken === reconnectToken)
     || room.players.find((player) => !player.isBot && !player.connected && samePlayerName(player.name, requestedName));
   if (returning) {
@@ -546,7 +560,7 @@ function startGame(room, playerId, forceRestart = false) {
   const unsupportedVersions = unsupportedHumanVersions(versions);
   if (versions.length > 1) return sendToPlayer(room, playerId, `All players must install the same APK version before start. Found: ${versions.join(" / ")}`);
   if (unsupportedVersions.length > 0) return sendToPlayer(room, playerId, `Install the latest APK v${SERVER_BUILD} before start. Found: ${unsupportedVersions.join(" / ")}`);
-  if (outdatedTrumpClients(room)) return sendToPlayer(room, playerId, 'Every phone needs Jhoota build 103 or newer for the balanced Trump rules.');
+  if (outdatedTrumpClients(room)) return sendToPlayer(room, playerId, 'Every phone needs Jhoota build 105 or newer for the balanced Trump rules.');
   let readiness = roomReadiness(room);
   const canHostAutoReady = !room.winner && hostCanAutoReady(room, playerId);
   if (!forceRestart && !readiness.allReady && canHostAutoReady) {
@@ -909,7 +923,7 @@ function stateFor(room, viewer) {
     totalKnownCards,
     serverProtocol: SERVER_PROTOCOL,
     serverBuild: SERVER_BUILD,
-    rulesRevision: 103,
+    rulesRevision: 105,
     versionMismatch,
     versionWarning: versionMismatch ? humanVersions.join(" / ") : "",
     serverVersionMismatch: unsupportedVersions.length > 0,
@@ -969,7 +983,7 @@ function startBlockReasonFor(room, viewer, readiness, humanVersions, versionMism
   const unsupportedVersions = unsupportedHumanVersions(humanVersions);
   if (humanVersions.length > 1) return `All phones need the same APK version. Found: ${humanVersions.join(" / ")}. Install the latest APK, then use Check Room.`;
   if (unsupportedVersions.length > 0) return `This server needs APK v${SERVER_BUILD}. Found: ${unsupportedVersions.join(" / ")}. Install the latest APK, then use Check Room.`;
-  if (outdatedTrumpClients(room)) return 'Every phone needs Jhoota build 103 or newer for the balanced Trump rules.';
+  if (outdatedTrumpClients(room)) return 'Every phone needs Jhoota build 105 or newer for the balanced Trump rules.';
   if (offlineHumans.length > 0) {
     return `Offline seat blocking start: ${offlineHumans.map((player) => player.name).join(", ")}. Host can Kick Offline or Bot Offline, then Check Room.`;
   }
@@ -998,7 +1012,7 @@ function roomReadiness(room) {
 }
 
 function outdatedTrumpClients(room) {
-  return room.gameType === 'trump' && room.players.some(p => !p.isBot && !(p.appBuild >= 103));
+  return room.gameType === 'trump' && room.players.some(p => !p.isBot && !(p.appBuild >= 105));
 }
 
 function humanVersionSet(room) {
@@ -1032,11 +1046,7 @@ function runBots(room) {
     const bot = currentPlayer(room);
     if (!bot?.isBot) return;
     if (room.gameType === "trump") {
-      if (!['choose', 'play'].includes(room.trump.phase)) return;
-      const error = room.trump.phase === "choose"
-        ? chooseTrump(room, bot.id, chooseBotTrump(bot))
-        : playTrump(room, bot.id, [chooseBotTrumpCard(room, bot)]);
-      if (!error) { broadcast(room); runBots(room); }
+      if (takeTrumpBotTurn(room)) { broadcast(room); runBots(room); }
       return;
     }
     takeBotTurn(room, bot);
@@ -1310,7 +1320,7 @@ function roomSummaryStartBlockReason(room, readiness, humanVersions, versionMism
   const unsupportedVersions = unsupportedHumanVersions(humanVersions);
   if (humanVersions.length > 1) return `All phones need the same APK version. Found: ${humanVersions.join(" / ")}.`;
   if (unsupportedVersions.length > 0) return `This server needs APK v${SERVER_BUILD}. Found: ${unsupportedVersions.join(" / ")}.`;
-  if (outdatedTrumpClients(room)) return 'Every phone needs Jhoota build 103 or newer for the balanced Trump rules.';
+  if (outdatedTrumpClients(room)) return 'Every phone needs Jhoota build 105 or newer for the balanced Trump rules.';
   if (offlineHumans.length > 0) return `Offline seat blocking start: ${offlineHumans.map((player) => player.name).join(", ")}.`;
   if (!readiness.allReady && unreadyHumans.length > 0) return `Waiting for ready: ${unreadyHumans.map((player) => player.name).join(", ")}.`;
   if (!readiness.allReady) return room.winner ? "Everyone must ready up again before rematch." : "All human players must ready up.";

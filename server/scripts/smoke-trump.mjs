@@ -22,7 +22,7 @@ async function connect() {
     if (message.type === 'state') client.state = message.state;
   });
   await new Promise((resolve, reject) => { client.ws.once('open', resolve); client.ws.once('error', reject); });
-  client.send = message => client.ws.send(JSON.stringify({ ...(['create', 'join'].includes(message.type) ? { appBuild: 103 } : {}), ...message }));
+  client.send = message => client.ws.send(JSON.stringify({ ...(['create', 'join'].includes(message.type) ? { appBuild: 105 } : {}), ...message }));
   return client;
 }
 
@@ -69,8 +69,15 @@ async function scenario(count) {
     for (const p of players) p.send({ type: 'setReady', ready: true }); await wait(() => host.state.allReady, 'ready for optional rule');
   }
   host.send({ type: 'start' });
+  await wait(() => players.every(p => p.state.trumpPhase === 'tossPick'), 'interactive toss');
+  assert.ok(players.every(p => p.state.hand.length === 0));
+  const selector = players.find(p => p.state.playerId === host.state.tossSelectorId);
+  selector.send({ type: 'trumpToss', choice: 'heads' });
+  await wait(() => players.every(p => p.state.trumpPhase === 'caller'), 'winning team caller selection');
+  const representative = players.find(p => p.state.playerId === host.state.currentPlayerId);
+  representative.send({ type: 'selectTrumpCaller', callerId: representative.state.playerId });
   await wait(() => players.every(p => p.state.trumpPhase === 'choose'), 'first five');
-  assert.ok(players.every(p => p.state.hand.length === 5 && p.state.deckOk));
+  assert.ok(players.every(p => p.state.hand.length === (p.state.playerId === host.state.trumpCallerId ? 5 : 0) && p.state.deckOk));
   assert.ok(players.every(p => !('reserve' in p.state) && !('captured' in p.state)));
   await expectError(host, { type: 'chooseTeam', team: 1 }, 'locked');
   await expectError(host, { type: 'shuffleTeams' }, 'locked');
@@ -84,6 +91,14 @@ async function scenario(count) {
   await expectError(caller, { type: 'extendTurn' }, 'already been used');
   await expectError(other, { type: 'chooseTrump', suit: 'H' }, 'Only the trump caller');
   caller.send({ type: 'chooseTrump', suit: 'H' });
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const before = caller.state.dealNumber;
+    await wait(() => players.every(p => p.state.trumpPhase === 'review') || caller.state.dealNumber > before, 'review or verified redeal');
+    if (caller.state.trumpPhase === 'review') break;
+    caller.send({ type: 'chooseTrump', suit: 'H' });
+  }
+  await wait(() => players.every(p => p.state.trumpPhase === 'review'), 'hand review');
+  for (const p of players) p.send({ type: 'reviewTrumpHand' });
   await wait(() => players.every(p => p.state.trumpPhase === 'play'), 'full deal');
   assert.ok(players.every(p => p.state.hand.length === (count === 6 ? 12 : count === 8 ? 10 : 13)));
   assert.equal(new Set(players.flatMap(p => p.state.hand)).size, count === 4 ? 52 : count === 6 ? 72 : 80);
@@ -121,12 +136,56 @@ async function scenario(count) {
   host.send({ type: 'start' });
   await wait(() => host.state.roundNumber === 2, 'rematch');
   assert.equal(host.state.callerSource, 'toss');
-  assert.equal(host.state.trumpSuit, ''); assert.equal(host.state.hand.length, 5);
+  assert.equal(host.state.trumpSuit, ''); assert.equal(host.state.hand.length, 0);
   assert.equal(host.state.extensionUsed, false);
   host.send({ type: 'endRoom' });
   await wait(() => host.messages.some(m => m.type === 'roomEnded'), 'cleanup');
   players.forEach(p => p.ws.terminate());
   console.log(`Trump ${count} seats: team selection, shuffle, full game and rematch passed (${moves} cards).`);
+}
+
+async function hiddenCardScenario() {
+  const players = [await connect()]; const host = players[0];
+  host.send({ type: 'create', name: 'HiddenHost', gameType: 'trump', appVersion: '0.95' }); await wait(() => host.state, 'hidden lobby');
+  for (let i = 1; i < 4; i++) { const client = await connect(); players.push(client); client.send({ type: 'join', roomId: host.state.roomId, name: 'Hidden' + i, appVersion: '0.95' }); await wait(() => client.state, 'hidden join'); }
+  host.send({ type: 'setCheatingRule', enabled: true }); await wait(() => players.every(p => p.state.cheatingAllowed), 'cheat rule consent');
+  for (const p of players) p.send({ type: 'setReady', ready: true }); await wait(() => host.state.allReady, 'hidden ready');
+  host.send({ type: 'start' }); await wait(() => players.every(p => p.state.trumpPhase === 'tossPick'), 'hidden toss');
+  players.find(p => p.state.playerId === host.state.tossSelectorId).send({ type: 'trumpToss', choice: 'heads' });
+  await wait(() => players.every(p => p.state.trumpPhase === 'caller'), 'hidden caller');
+  const caller = players.find(p => p.state.playerId === host.state.currentPlayerId); caller.send({ type: 'selectTrumpCaller', callerId: caller.state.playerId });
+  await wait(() => players.every(p => p.state.trumpPhase === 'choose'), 'hidden first five');
+  for (let i = 0; i < 50; i++) { const before = caller.state.dealNumber; caller.send({ type: 'chooseTrump', suit: 'H' }); await wait(() => players.every(p => p.state.trumpPhase === 'review') || caller.state.dealNumber > before, 'hidden full deal'); if (caller.state.trumpPhase === 'review') break; }
+  for (const p of players) p.send({ type: 'reviewTrumpHand' }); await wait(() => players.every(p => p.state.trumpPhase === 'play'), 'hidden review');
+  const order = host.state.players.map(p => players.find(c => c.state.playerId === p.id));
+  let victim;
+  for (let moves = 0; moves < 40 && !victim; moves++) {
+    await wait(() => players.every(p => p.state.trumpPhase === 'play'), 'hidden hand ready');
+    const current = players.find(p => p.state.playerId === host.state.currentPlayerId);
+    await wait(() => current.state.currentPlayerId === current.state.playerId, 'hidden current private state');
+    if (current.state.canHideCard) { victim = current; break; }
+    const next = order[(order.indexOf(current) + 1) % 4];
+    const lead = current.state.trick.length ? current.state.legalCards[0] : current.state.legalCards.find(c => next.state.hand.some(n => n.endsWith(c.slice(-1))) && next.state.hand.some(n => !n.endsWith(c.slice(-1)))) || current.state.legalCards[0];
+    const before = JSON.stringify(host.state); current.send({ type: 'play', cards: [lead] }); await wait(() => JSON.stringify(host.state) !== before, 'hidden lead');
+  }
+  assert(victim, 'a legal cheating opportunity');
+  const lead = victim.state.leadSuit, saved = victim.state.hand.find(c => c.endsWith(lead)), off = victim.state.hand.find(c => !c.endsWith(lead));
+  victim.send({ type: 'play', cards: [off], hideCard: saved }); await wait(() => victim.state.hiddenCard === saved, 'private saved card');
+  await wait(() => players.every(p => p.state.players.find(p => p.id === victim.state.playerId).cardCount === victim.state.hand.length), 'private states settled');
+  assert(victim.state.cheatingUsed); for (const p of players.filter(p => p !== victim)) { assert.equal(p.state.hiddenCard, ''); assert.equal(p.state.cheatingUsed, false); assert(!('cheatEvidence' in p.state)); }
+  const victimTeam = victim.state.players.find(p => p.id === victim.state.playerId).team;
+  const opponents = players.filter(p => p.state.players.find(s => s.id === p.state.playerId).team !== victimTeam);
+  const innocent = players.find(p => p !== victim && p.state.players.find(s => s.id === p.state.playerId).team === victimTeam);
+  opponents[0].send({ type: 'catchTrumpCheat', targetId: innocent.state.playerId }); await wait(() => players.every(p => p.state.trumpPhase === 'accusation'), 'wrong accusation pause');
+  assert(players.every(p => !p.state.winner && !p.state.cheatVerdict.guilty));
+  await wait(() => players.every(p => p.state.trumpPhase !== 'accusation'), 'wrong accusation resume');
+  await expectError(opponents[0], { type: 'catchTrumpCheat', targetId: victim.state.playerId }, 'already used');
+  const beforeScores = [...host.state.teamScores];
+  opponents[1].send({ type: 'catchTrumpCheat', targetId: victim.state.playerId }); await wait(() => players.every(p => p.state.winner), 'guilty immediate victory');
+  assert(host.state.cheatVerdict.guilty); assert.equal(host.state.cheatVerdict.evidence.hiddenCard, saved); assert.deepEqual(host.state.teamScores, beforeScores);
+  assert.equal(host.state.coat, false); assert.match(host.state.winnerReason, /catching a cheat/);
+  host.send({ type: 'endRoom' }); await wait(() => host.messages.some(m => m.type === 'roomEnded'), 'hidden cleanup'); players.forEach(p => p.ws.terminate());
+  console.log('Online hidden card: private state, legal activation, wrong challenge resume, once-only challenge and immediate catch victory passed.');
 }
 
 async function bluffExtensions() {
@@ -154,11 +213,12 @@ try {
   const old = await connect(); old.send({ type: 'create', name: 'Old APK', gameType: 'trump', appVersion: '0.95', appBuild: 100 });
   await wait(() => old.state, 'old APK lobby'); old.send({ type: 'fillBots', target: 4, difficulty: 'Pro' });
   await wait(() => old.state.playerCount === 4, 'old APK balanced lobby');
-  assert.equal(old.state.canStart, false); assert.match(old.state.startBlockReason, /build 103/);
-  await expectError(old, { type: 'start' }, 'build 103'); old.send({ type: 'endRoom' });
+  assert.equal(old.state.canStart, false); assert.match(old.state.startBlockReason, /build 105/);
+  await expectError(old, { type: 'start' }, 'build 105'); old.send({ type: 'endRoom' });
   await wait(() => old.messages.some(m => m.type === 'roomEnded'), 'old APK cleanup');
   console.log('Old Trump APK cannot start incompatible two-deck rules.');
   for (const count of [4, 6, 8]) await scenario(count);
+  await hiddenCardScenario();
   await bluffExtensions();
   const host = await connect(); host.send({ type: 'create', name: 'OddSeats', gameType: 'trump', appVersion: '0.95' });
   await wait(() => host.state, 'odd lobby');
@@ -170,8 +230,16 @@ try {
   host.send({ type: 'setBotSpeed', speed: 'Fast' }); host.send({ type: 'start' });
   await wait(() => host.state.started, 'balanced bot start');
   // Exercise scheduled bots and a human, independent of who wins the toss.
-  await wait(() => host.state.trumpPhase === 'play' || host.state.trumpPhase === 'choose' && host.state.trumpCallerId === host.state.playerId, 'bot call');
-  if (host.state.trumpPhase === 'choose') host.send({ type: 'chooseTrump', suit: 'S' });
+  for (let stage = 0; stage < 50 && host.state.trumpPhase !== 'play'; stage++) {
+    const before = JSON.stringify(host.state);
+    if (host.state.trumpPhase === 'review') host.send({ type: 'reviewTrumpHand' });
+    else if (host.state.currentPlayerId === host.state.playerId) {
+      if (host.state.trumpPhase === 'tossPick') host.send({ type: 'trumpToss', choice: 'heads' });
+      if (host.state.trumpPhase === 'caller') host.send({ type: 'selectTrumpCaller', callerId: host.state.playerId });
+      if (host.state.trumpPhase === 'choose') host.send({ type: 'chooseTrump', suit: 'S' });
+    }
+    await wait(() => JSON.stringify(host.state) !== before, 'offline-equivalent bot opening');
+  }
   await wait(() => host.state.trumpPhase === 'play', 'bot play');
   await wait(() => host.state.currentPlayerId === host.state.playerId, 'bots reach human');
   assert.ok(host.state.legalCards.length);

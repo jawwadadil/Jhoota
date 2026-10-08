@@ -20,13 +20,12 @@
     clearTimeout(timer); publish();
     const current = room.players[room.currentIndex];
     if (room.winner) return;
-    const waiting = ['toss', 'reveal'].includes(room.trump.phase);
+    const waiting = ['toss', 'reveal', 'accusation', 'finishChallenge'].includes(room.trump.phase);
     const delay = waiting ? Math.max(1, room.trump.resolveAt - Date.now())
-      : current.isBot ? 700 : Math.max(1, room.trump.deadline - Date.now());
+      : current.isBot && room.trump.phase !== 'review' ? ({ Slow: 1400, Normal: 700, Fast: 350 }[config.speed] || 700) : Math.max(1, room.trump.deadline - Date.now());
     timer = setTimeout(() => {
       if (advanceTrump(room)) { bots(); return; }
-      if (current.isBot && room.trump.phase === 'choose') chooseTrump(room, current.id, chooseBotTrump(current));
-      else if (current.isBot && room.trump.phase === 'play') playTrump(room, current.id, [chooseBotTrumpCard(room, current)]);
+      takeTrumpBotTurn(room);
       bots();
     }, delay);
   };
@@ -42,16 +41,22 @@
         id: i === 0 ? 'you' : 'bot-' + i, name: i === 0 ? config.name : 'Bot ' + i,
         avatarIndex: i === 0 ? config.avatarIndex : 7, team: i % 2, hand: [],
         isBot: i !== 0, difficulty: config.difficulty,
-      })), currentIndex: 0, started: true, log: [], roundNumber: 0, requireTrumpOpened: Boolean(config.requireTrumpOpened) };
+      })), currentIndex: 0, started: true, log: [], roundNumber: 0, requireTrumpOpened: Boolean(config.requireTrumpOpened), cheatingAllowed: Boolean(config.cheatingAllowed) };
       begin();
     },
     action(type, value) {
       let error = '';
-      if (type === 'play') error = playTrump(room, 'you', JSON.parse(value).cards);
+      if (type === 'play') { const move = JSON.parse(value); error = playTrump(room, 'you', move.cards, Date.now(), move.hideCard || ''); }
+      else if (type === 'toss') error = callTrumpToss(room, 'you', value);
+      else if (type === 'caller') error = selectTrumpCaller(room, 'you', value);
+      else if (type === 'review') error = reviewTrumpHand(room, 'you');
+      else if (type === 'redeal') error = requestTrumpRedeal(room, 'you');
+      else if (type === 'catchCheat') error = catchTrumpCheat(room, 'you', value);
       else if (type === 'extend') error = extendTrumpTurn(room, 'you');
       else if (type === 'trump') error = chooseTrump(room, 'you', value);
       else if (type === 'start' && room.winner) begin();
       else if (type === 'trumpLeadRule' && room.winner) room.requireTrumpOpened = value === 'true';
+      else if (type === 'cheatingRule' && room.winner) room.cheatingAllowed = value === 'true';
       else if (type === 'team' && room.winner) {
         const team = Number(value), me = human();
         if ([0, 1].includes(team) && me.team !== team) {

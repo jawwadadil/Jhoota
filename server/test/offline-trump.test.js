@@ -18,14 +18,17 @@ for (const count of [4, 6, 8]) for (const difficulty of ['Low', 'Medium', 'Pro']
     } }, Date: class extends Date { static now() { return now; } }, setTimeout: (fn, delay) => { timers.set(++next, { fn, at: now + delay }); return next; }, clearTimeout: id => timers.delete(id) });
     vm.runInContext(rules.replaceAll('export function ', 'function ').replaceAll('export const ', 'const ') + '\n' + glue, context);
     context.window.OfflineTrump.start({ count, difficulty, name: 'You', avatarIndex: 8, requireTrumpOpened: difficulty === 'Pro' });
-    assert.equal(state.hand.length, 5); assert.equal(state.offline, true);
+    assert.equal(state.hand.length, 0); assert.equal(state.trumpPhase, 'tossPick'); assert.equal(state.offline, true);
     assert.equal(state.requireTrumpOpened, difficulty === 'Pro');
     let moves = 0, extended = false;
     while (!state.winner && moves++ < 150) {
       assert.equal(state.deckOk, true); assert.equal(state.playerCount, count);
       assert.equal(state.totalKnownCards, count === 4 ? 52 : count === 6 ? 72 : 80);
       assert(!('reserve' in state)); assert(state.players.every(p => !('hand' in p)));
-      if (state.currentPlayerId === 'you' && ['choose', 'play'].includes(state.trumpPhase)) {
+      if (state.trumpPhase === 'review') context.window.OfflineTrump.action('review', '');
+      else if (state.currentPlayerId === 'you' && state.trumpPhase === 'tossPick') context.window.OfflineTrump.action('toss', 'heads');
+      else if (state.currentPlayerId === 'you' && state.trumpPhase === 'caller') context.window.OfflineTrump.action('caller', 'you');
+      else if (state.currentPlayerId === 'you' && ['choose', 'play'].includes(state.trumpPhase)) {
         if (!extended) {
           const deadline = state.turnDeadline; assert.equal(state.canExtendTurn, true);
           context.window.OfflineTrump.action('extend', ''); assert.equal(state.turnDeadline, deadline + 15000); assert.equal(state.extensionUsed, true); assert.equal(state.canExtendTurn, false);
@@ -46,7 +49,7 @@ for (const count of [4, 6, 8]) for (const difficulty of ['Low', 'Medium', 'Pro']
     assert.equal(state.players.filter(p => p.team === 0).length, count / 2);
     context.window.OfflineTrump.action('trumpLeadRule', 'true'); assert.equal(state.requireTrumpOpened, true);
     context.window.OfflineTrump.action('start', '');
-    assert.equal(state.roundNumber, 2); assert.equal(state.hand.length, 5); assert.equal(state.winner, '');
+    assert.equal(state.roundNumber, 2); assert.equal(state.hand.length, 0); assert.equal(state.winner, '');
     assert.equal(state.requireTrumpOpened, true); assert.equal(state.extensionUsed, false);
   });
 }

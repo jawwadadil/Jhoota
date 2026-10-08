@@ -1,8 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { beginTrump as startTrump, advanceTrump, REVEAL_MS, TURN_MS, EXTENSION_MS, trumpDeck, extendTrumpTurn, chooseTrump, playTrump, legalTrumpCards, trickWinner, trumpPublicState, chooseBotTrumpCard, chooseBotTrump } from '../trump.js';
+import { beginTrump as startTrump, advanceTrump, REVEAL_MS, TURN_MS, EXTENSION_MS, callTrumpToss, selectTrumpCaller, reviewTrumpHand, trumpDeck, extendTrumpTurn, chooseTrump as chooseRaw, playTrump, legalTrumpCards, trickWinner, trumpPublicState, chooseBotTrumpCard, chooseBotTrump } from '../trump.js';
 
-function beginTrump(r, random) { startTrump(r, random); advanceTrump(r, r.trump.resolveAt); }
+function beginTrump(r, rng) {
+  startTrump(r, rng);
+  if (r.trump.phase === 'tossPick') { callTrumpToss(r, r.players[r.currentIndex].id, 'heads', Date.now(), () => 0); advanceTrump(r, r.trump.resolveAt); }
+  selectTrumpCaller(r, r.players[r.currentIndex].id, r.players[r.currentIndex].id);
+}
+function chooseTrump(r, id, suit, now = Date.now()) {
+  let error = chooseRaw(r, id, suit, now);
+  for (let retry = 0; !error && r.trump.phase === 'choose' && retry < 100; retry++) error = chooseRaw(r, id, suit, now);
+  if (!error && r.trump.phase === 'review') r.players.forEach(p => reviewTrumpHand(r, p.id, now));
+  return error;
+}
 function resolve(r) { if (r.trump.phase === 'reveal') advanceTrump(r, r.trump.resolveAt); }
 
 function room(count) {
@@ -13,7 +23,7 @@ function random(seed) { return () => { seed = (Math.imul(seed, 1664525) + 101390
 for (const count of [4, 6, 8]) {
   test(`${count} players: exactly five visible cards, private reserve, equal complete deal`, () => {
     const r = room(count); beginTrump(r, random(count));
-    assert(r.players.every(p => p.hand.length === 5));
+    assert(r.players.every((p, i) => p.hand.length === (i === r.currentIndex ? 5 : 0)));
     const snapshot = trumpPublicState(r, r.players[0]);
     assert(!('reserve' in snapshot));
     assert(snapshot.deckOk);
@@ -58,7 +68,7 @@ for (const count of [4, 6, 8]) {
       r.winner = null; beginTrump(r, random(seed + 200));
       if (winners.length) assert(winners.includes(r.players[r.currentIndex].id));
       assert.equal(r.trump.suit, null);
-      assert(r.players.every(p => p.hand.length === 5));
+      assert(r.players.every((p, i) => p.hand.length === (i === r.currentIndex ? 5 : 0)));
       assert(trumpPublicState(r, r.players[0]).handWins.every(p => p.handsWon === 0));
       assert.deepEqual(r.trump.handHistory, []);
     }
@@ -110,15 +120,18 @@ test('coat scores three total, not four; even-hand ties are draws', () => {
   playTrump(d, '5', ['4C']); resolve(d); assert.equal(d.winner, 'Draw'); assert.deepEqual(d.trump.points, [0, 0]);
 });
 
-test('visible toss locks play, then begins a full trump-choice timer', () => {
-  const r = room(4); startTrump(r, () => .25, 1000);
-  assert.equal(r.trump.phase, 'toss'); assert.equal(r.trump.callerSource, 'toss');
-  assert.equal(r.currentIndex, 1); assert.equal(r.trump.resolveAt, 1000 + REVEAL_MS);
-  assert(chooseTrump(r, '1', 'H')); assert(playTrump(r, '1', [r.players[1].hand[0]]));
-  assert.equal(advanceTrump(r, 3999), false); assert.equal(advanceTrump(r, 4000), true);
-  assert.equal(r.trump.phase, 'choose'); assert.equal(r.trump.deadline, 4000 + TURN_MS);
-  assert.equal(advanceTrump(r, 34000), true); assert.equal(r.trump.phase, 'play');
-  assert(r.players.every(p => p.hand.length === 13));
+test('interactive toss waits for a choice, then the winning team selects the caller', () => {
+  const r = room(4); startTrump(r, random(1), 1000);
+  assert.equal(r.trump.phase, 'tossPick'); assert(r.players.every(p => p.hand.length === 0));
+  assert(callTrumpToss(r, '1', 'heads', 1000));
+  assert.equal(callTrumpToss(r, '0', 'tails', 1000, () => .25), '');
+  assert.equal(r.trump.winningTeam, 1); assert.equal(r.trump.phase, 'toss');
+  assert.equal(advanceTrump(r, 3999), false); advanceTrump(r, 4000);
+  assert.equal(r.trump.phase, 'caller'); assert(selectTrumpCaller(r, '0', '0', 4000));
+  assert.equal(selectTrumpCaller(r, '1', '3', 4000), '');
+  assert.equal(r.players[3].hand.length, 5); assert.equal(r.trump.deadline, 4000 + TURN_MS);
+  advanceTrump(r, 34000); assert.equal(r.trump.phase, 'review');
+  r.players.forEach(p => reviewTrumpHand(r, p.id, 34001)); assert.equal(r.trump.phase, 'play');
 });
 
 test('expiry auto-follows suit without consuming an extra turn; duplicate ranks tie first', () => {
@@ -169,8 +182,8 @@ test('leading trump is unrestricted by default; optional rule follows suit and o
 });
 
 test('extra time belongs to the current human, is once per game and survives a new turn', () => {
-  const r = room(4); startTrump(r, () => 0, 1000);
-  assert(extendTrumpTurn(r, '0', 1001)); advanceTrump(r, 4000);
+  const r = room(4); startTrump(r, random(1), 1000); callTrumpToss(r, '0', 'heads', 1000, () => 0);
+  assert(extendTrumpTurn(r, '0', 1001)); advanceTrump(r, 4000); selectTrumpCaller(r, '0', '0', 4000);
   assert(extendTrumpTurn(r, '1', 4001)); assert.equal(extendTrumpTurn(r, '0', 4001), '');
   assert.equal(r.trump.deadline, 4000 + TURN_MS + EXTENSION_MS); assert(extendTrumpTurn(r, '0', 4002));
   chooseTrump(r, '0', 'S', 5000); assert(extendTrumpTurn(r, '0', 5001));
@@ -179,7 +192,7 @@ test('extra time belongs to the current human, is once per game and survives a n
   r.players[1].isBot = false; assert.equal(extendTrumpTurn(r, '1', 5001), '');
   assert(extendTrumpTurn(r, '1', r.trump.deadline)); r.trump.phase = 'reveal'; assert(extendTrumpTurn(r, '1', 5002));
   r.winner = 'Team A'; assert(extendTrumpTurn(r, '1', 5002)); r.winner = null;
-  startTrump(r, () => 0, 6000); assert.deepEqual(r.trump.extensions, []);
+  startTrump(r, random(2), 6000); assert.deepEqual(r.trump.extensions, []);
 });
 
 test('unfilled lobby exposes no fractional card counts', () => {
