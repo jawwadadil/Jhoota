@@ -10,7 +10,7 @@
       message.state.offline = Boolean(solo);
       message.state.liveCalls = false;
       message.state.connectionLabel = solo ? 'Offline with Bots' : 'Nearby';
-      if (solo) { message.state.paused = paused; message.state.canStart = Boolean(message.state.winner); }
+      if (solo) { message.state.paused = paused; message.state.canStart = !message.state.started || Boolean(message.state.winner); }
     }
     bridge.send(id, JSON.stringify(message));
     if (message.type === 'created') bridge.room(message.roomId, rooms.get(message.roomId).gameType);
@@ -18,7 +18,7 @@
   const snapshot = () => {
     const now = Date.now();
     const copy = [...rooms.values()].map(room => JSON.parse(JSON.stringify(room, (key, value) =>
-      ['socket', 'botTimer', 'trumpRandom'].includes(key) ? undefined : value)));
+      ['socket', 'callSocket', 'botTimer', 'trumpRandom'].includes(key) ? undefined : value)));
     for (const room of copy) {
       if (room.pausedAt != null) {
         const shift = Math.max(0, now - room.pausedAt);
@@ -65,7 +65,9 @@
       if (room.trump?.deadline) room.trump.deadline += shift;
       if (room.trump?.resolveAt) room.trump.resolveAt += shift;
       delete room.pausedAt;
-      for (const p of room.players) { p.socket = null; p.connected = Boolean(p.isBot); }
+      room.waitingPlayers ||= [];
+      for (const p of roomMembers(room)) { p.socket = null; p.connected = Boolean(p.isBot); p.callJoined = false; p.callSpeaking = false; }
+      if (room.trump) { room.trump.pendingPile ||= []; room.trump.variant ||= 'single'; room.trump.previousWinnerId ||= ''; room.trump.collectionCount ??= 0; }
       room.trumpRandom = Math.random;
       rooms.set(room.id, room);
     }
@@ -105,10 +107,11 @@
       if (config.gameType === 'trump' ? ![4, 6, 8].includes(config.count) : !Number.isInteger(config.count) || config.count < 2 || config.count > 8) throw Error('Choose a valid player count.');
       // Mark solo before the first room state so call controls never flash on screen.
       solo = { roomId: '', playerId: '' };
-      createRoom(socket, config.name, config.avatarIndex, '0.95', config.gameType, 106, config.requireTrumpOpened);
+      createRoom(socket, config.name, config.avatarIndex, '0.95', config.gameType, 108, config.requireTrumpOpened);
       const room = rooms.get(socket.roomId);
       solo = { roomId: room.id, playerId: socket.playerId };
       room.cheatingAllowed = Boolean(config.cheatingAllowed);
+      room.trumpVariant = config.trumpVariant === 'double' ? 'double' : 'single';
       room.seriesLength = [0, 3, 5].includes(config.seriesLength) ? config.seriesLength : 0;
       room.botSpeedMs = { Slow: 1400, Normal: 700, Fast: 350 }[config.speed] || 700;
       fillBots(room, socket.playerId, config.count, config.difficulty);
@@ -116,7 +119,7 @@
     },
     botAction(type, value) {
       const message = { type };
-      const map = { trump: ['chooseTrump', 'suit'], toss: ['trumpToss', 'choice'], caller: ['selectTrumpCaller', 'callerId'], review: ['reviewTrumpHand'], redeal: ['requestTrumpRedeal'], catchCheat: ['catchTrumpCheat', 'targetId'], extend: ['extendTurn'], team: ['chooseTeam', 'team'], shuffle: ['shuffleTeams'], trumpLeadRule: ['setTrumpLeadRule', 'enabled'], cheatingRule: ['setCheatingRule', 'enabled'], series: ['setSeries', 'length'] };
+      const map = { variant: ['setTrumpVariant', 'variant'], removeBot: ['removeBot', 'botId'], lobby: ['returnLobby'], trump: ['chooseTrump', 'suit'], toss: ['trumpToss', 'choice'], caller: ['selectTrumpCaller', 'callerId'], review: ['reviewTrumpHand'], redeal: ['requestTrumpRedeal'], catchCheat: ['catchTrumpCheat', 'targetId'], extend: ['extendTurn'], team: ['chooseTeam', 'team'], shuffle: ['shuffleTeams'], trumpLeadRule: ['setTrumpLeadRule', 'enabled'], cheatingRule: ['setCheatingRule', 'enabled'], series: ['setSeries', 'length'] };
       if (type === 'play') Object.assign(message, JSON.parse(value));
       if (map[type]) { message.type = map[type][0]; if (map[type][1]) message[map[type][1]] = ['team', 'length'].includes(map[type][1]) ? Number(value) : map[type][1] === 'enabled' ? value === 'true' : value; }
       if (type === 'start') { this.pause(false); setReady(rooms.get(solo.roomId), solo.playerId, true); }

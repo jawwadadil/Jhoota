@@ -40,6 +40,7 @@ export function beginTrump(room, random = Math.random, now = Date.now()) {
     resolveAt: 0, deadline: now + TURN_MS,
     undealt: deck, reserve: room.players.map(() => []), trick: [], lastTrick: [], lastTrickWinner: '',
     captured: [], scores: [0, 0], points: previous?.points || [0, 0],
+    variant: room.trumpVariant === 'double' ? 'double' : 'single', pendingPile: [], previousWinnerId: '', collectionCount: 0,
     handWins: Object.fromEntries(room.players.map(p => [p.id, 0])), handHistory: [],
     resultPlayers: room.players.map(p => ({ playerId: p.id, name: p.name, avatarIndex: p.avatarIndex, team: p.team })),
     extensions: [], requireTrumpOpened: Boolean(room.requireTrumpOpened), trumpOpened: false,
@@ -186,10 +187,14 @@ export function playTrump(room, playerId, cards, now = Date.now(), hideCard = ''
   }
   const winning = trickWinner(t.trick, t.suit);
   room.currentIndex = room.players.findIndex(p => p.id === winning.playerId);
-  t.scores[winning.team]++;
   t.completedTricks++;
+  t.collectionCount = t.variant === 'double'
+    ? (t.previousWinnerId === winning.playerId || t.completedTricks === t.totalTricks ? t.pendingPile.length / room.players.length + 1 : 0)
+    : 1;
+  t.scores[winning.team] += t.collectionCount;
+  t.previousWinnerId = t.collectionCount ? '' : winning.playerId;
   t.handWins[winning.playerId] = (t.handWins[winning.playerId] || 0) + 1;
-  t.handHistory.push({ hand: t.completedTricks, playerId: winning.playerId, name: winning.name, team: winning.team });
+  t.handHistory.push({ hand: t.completedTricks, playerId: winning.playerId, name: winning.name, team: winning.team, collected: t.collectionCount });
   t.lastTrick = [...t.trick];
   t.lastTrickWinner = winning.name;
   t.trickHistory.push({ hand: t.completedTricks, leadSuit: t.trick[0].card.slice(-1), winnerId: winning.playerId, winnerName: winning.name, team: winning.team, cards: t.trick.map(p => ({ ...p })) });
@@ -197,6 +202,7 @@ export function playTrump(room, playerId, cards, now = Date.now(), hideCard = ''
   t.resolveAt = now + REVEAL_MS;
   t.deadline = 0;
   room.log.push(`${winning.name} takes hand ${t.completedTricks}. Team ${winning.team === 0 ? 'A' : 'B'} leads next.`);
+  if (t.variant === 'double') room.log.push(t.collectionCount ? `${winning.name} collects ${t.collectionCount} hands for their team.` : `Hand stays in the centre. ${winning.name} needs one more consecutive win.`);
   const target = Math.floor(t.totalTricks / 2) + 1;
   t.gameComplete = Math.max(...t.scores) >= target || t.completedTricks >= t.totalTricks;
   return '';
@@ -229,7 +235,9 @@ export function advanceTrump(room, now = Date.now()) {
   }
   if (t.phase === 'finishChallenge' && now >= t.resolveAt) { finishTrump(room); return true; }
   if (t.phase === 'reveal' && now >= t.resolveAt) {
-    t.captured.push(...t.trick.map(p => p.card)); t.trick = [];
+    if (t.variant === 'double' && !t.collectionCount) t.pendingPile.push(...t.trick.map(p => p.card));
+    else { t.captured.push(...t.pendingPile, ...t.trick.map(p => p.card)); t.pendingPile = []; }
+    t.trick = [];
     t.resolveAt = 0;
     if (t.gameComplete && t.cheatingAllowed) { t.phase = 'finishChallenge'; t.resolveAt = now + CHALLENGE_MS; }
     else if (t.gameComplete) finishTrump(room);
@@ -277,7 +285,7 @@ function finishTrump(room, forcedTeam = -1, reason = '') {
   } else {
     t.winnerTeam = forcedTeam >= 0 ? forcedTeam : t.scores[0] > t.scores[1] ? 0 : 1;
     t.winnerPlayerIds = room.players.filter((p, i) => i % 2 === t.winnerTeam).map(p => p.id);
-    t.coat = forcedTeam < 0 && t.scores[1 - t.winnerTeam] === 0;
+    t.coat = forcedTeam < 0 && t.scores[1 - t.winnerTeam] === 0 && (t.variant !== 'double' || t.scores[t.winnerTeam] === t.totalTricks);
     t.points[t.winnerTeam] += t.coat ? 3 : 1;
     room.winner = `Team ${t.winnerTeam === 0 ? 'A' : 'B'}`;
     room.players.forEach((p, i) => { if (i % 2 === t.winnerTeam) p.wins = (p.wins || 0) + 1; });
@@ -287,12 +295,15 @@ function finishTrump(room, forcedTeam = -1, reason = '') {
 }
 
 export function trumpPublicState(room, viewer) {
-  const t = room.trump;
+  const t = room.started || room.winner ? room.trump : null;
   const caller = t && room.players[t.callerIndex];
-  const known = t ? t.captured.length + t.trick.length + room.players.reduce((sum, p) => sum + p.hand.length, 0) + t.undealt.length : 0;
+  const known = t ? t.captured.length + (t.pendingPile?.length || 0) + t.trick.length + room.players.reduce((sum, p) => sum + p.hand.length, 0) + t.undealt.length : 0;
   const most = t ? Math.max(0, ...Object.values(t.handWins)) : 0;
   return {
     gameType: 'trump', trumpSuit: t?.suit || '', trumpPhase: t?.phase || 'lobby',
+    trumpVariant: room.started && !room.winner ? t?.variant || 'single' : room.trumpVariant || 'single',
+    pileHands: t?.variant === 'double' ? (t.pendingPile?.length || 0) / room.players.length + (t.phase === 'reveal' && !t.collectionCount ? 1 : 0) : 0,
+    collectedHands: t?.phase === 'reveal' ? t.collectionCount || 0 : 0, streakPlayerId: t?.previousWinnerId || '',
     trumpCallerId: caller?.id || '', trumpCallerName: caller?.name || '',
     callerSource: t?.callerSource || '', phaseEndsAt: t?.resolveAt || 0,
     tossSelectorId: t?.tossSelectorId || '', tossChoice: t?.tossChoice || '', tossResult: t?.tossResult || '', tossWinningTeam: t?.winningTeam ?? -1,

@@ -39,7 +39,7 @@ const httpServer = http.createServer((request, response) => {
       name: SERVER_NAME,
       serverProtocol: SERVER_PROTOCOL,
       serverBuild: SERVER_BUILD,
-      rulesRevision: 106,
+      rulesRevision: 108,
       heartbeatMs: HEARTBEAT_MS,
       roomTtlMinutes: Math.round(ROOM_TTL_MS / 60000),
       uptimeSeconds: Math.floor(process.uptime()),
@@ -110,7 +110,7 @@ httpServer.listen(PORT, HOST, () => {
 setInterval(() => {
   const now = Date.now();
   for (const [roomId, room] of rooms) {
-    const hasConnectedHuman = room.players.some((player) => !player.isBot && player.connected);
+    const hasConnectedHuman = roomMembers(room).some((player) => !player.isBot && (player.connected || player.callJoined));
     if (!hasConnectedHuman && now - (room.updatedAt || now) > ROOM_TTL_MS) {
       rooms.delete(roomId);
     }
@@ -131,6 +131,7 @@ const heartbeatTimer = setInterval(() => {
 const turnTimer = setInterval(() => {
   const now = Date.now();
   for (const room of rooms.values()) {
+    expireCallPresence(room, now);
     if (!room.started || room.winner) continue;
     if (!room.players.some(p => !p.isBot && p.connected)) continue;
     if (room.gameType === 'trump') {
@@ -182,6 +183,11 @@ server.on("connection", (socket) => {
   });
 
   socket.on("close", () => {
+    if (socket.callRoomId) {
+      const callRoom = rooms.get(socket.callRoomId);
+      const caller = callRoom && roomMembers(callRoom).find(p => p.id === socket.callPlayerId && p.callSocket === socket);
+      if (caller) { caller.callJoined = false; caller.callSpeaking = false; caller.callSocket = null; broadcastCallActivity(callRoom); }
+    }
     if (!socket.roomId || !socket.playerId) return;
     const room = rooms.get(socket.roomId);
     if (!room) return;
@@ -191,11 +197,22 @@ server.on("connection", (socket) => {
 
 
 function handle(socket, message) {
+  if (message.type === 'callPresence') return updateCallPresence(socket, message);
   if (message.type === "create") return createRoom(socket, message.name, message.avatarIndex, message.appVersion, message.gameType, message.appBuild, message.requireTrumpOpened);
   if (message.type === "join") return joinRoom(socket, message.roomId, message.name, message.avatarIndex, message.reconnectToken, message.appVersion, message.appBuild);
 
   const room = rooms.get(socket.roomId);
   if (!room) return send(socket, { type: "error", message: "Join a room first." });
+  const seat = roomMembers(room).find(p => p.id === socket.playerId && p.socket === socket);
+  if (!seat) return send(socket, { type: 'error', message: 'Reconnect to your room first.' });
+  if ((room.waitingPlayers || []).includes(seat) && !['leave', 'liveCallToken', 'chat', 'sticker'].includes(message.type)) return send(socket, { type: 'error', message: 'You are waiting for the next game. The current deal stays unchanged.' });
+  if (message.type === 'returnLobby') return returnLobby(room, socket.playerId);
+  if (message.type === 'removeBot') return removeBot(room, socket.playerId, message.botId);
+  if (message.type === 'setTrumpVariant') {
+    if (room.gameType !== 'trump' || room.hostId !== socket.playerId || room.started && !room.winner || !['single', 'double'].includes(message.variant)) return send(socket, { type: 'error', message: 'Only the host can choose Single or Double Hand in the lobby.' });
+    room.trumpVariant = message.variant; room.players.forEach(p => { if (!p.isBot) p.ready = false; });
+    room.log.push(`Host selected ${message.variant === 'double' ? 'Double' : 'Single'} Hand.`); return broadcast(room);
+  }
   if (message.type === 'setSeries') {
     const error = setSeries(room, socket.playerId, message.length);
     if (error) return sendToPlayer(room, socket.playerId, error);
@@ -273,11 +290,11 @@ function handle(socket, message) {
   if (message.type === "chat") return chat(room, socket.playerId, message.value || "");
   if (message.type === "voice") return voice(room, socket.playerId, message.data, message.durationMs);
   if (message.type === 'liveCallToken') {
-    const player = room.players.find(p => p.id === socket.playerId && p.socket === socket);
+    const player = roomMembers(room).find(p => p.id === socket.playerId && p.socket === socket);
     if (!player) return send(socket, { type: 'liveCallError', message: 'Rejoin your game room first.' });
-    if (player.lastCallTokenAt && Date.now() - player.lastCallTokenAt < 3000) return send(socket, { type: 'liveCallError', message: 'Wait a moment before retrying the call.' });
-    player.lastCallTokenAt = Date.now();
-    try { return send(socket, { type: 'liveCallToken', roomId: room.id, ...liveCallCredentials(room, player) }); }
+    if (player.lastCallRequestAt && Date.now() - player.lastCallRequestAt < 3000) return send(socket, { type: 'liveCallError', message: 'Wait a moment before retrying the call.' });
+    player.lastCallRequestAt = Date.now();
+    try { const credentials = liveCallCredentials(room, player); player.lastCallTokenAt = Date.now(); return send(socket, { type: 'liveCallToken', roomId: room.id, ...credentials }); }
     catch (error) { return send(socket, { type: 'liveCallError', message: error.message }); }
   }
   if (message.type === "endRoom") return endRoom(room, socket.playerId);
@@ -296,7 +313,7 @@ function createRoom(socket, name, avatarIndex, appVersion, gameType, appBuild, r
     nightId: randomUUID(),
     gameType: gameType === "trump" ? "trump" : "bluff",
     hostId: player.id,
-    players: [player],
+    players: [player], waitingPlayers: [], trumpVariant: 'single',
     started: false,
     requireTrumpOpened: requireTrumpOpened === true, cheatingAllowed: false, turnExtensions: [],
     activeRank: null,
@@ -333,7 +350,7 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion,
   }
   const requestedName = cleanName(name, "Player");
   if (room.gameType === 'trump' && room.started && !room.winner && !(Number.isSafeInteger(appBuild) && appBuild >= 105)) return send(socket, { type: 'error', message: 'Install Jhoota build 105 or newer to rejoin this Trump game.' });
-  const returning = room.players.find((player) => !player.isBot && player.reconnectToken && player.reconnectToken === reconnectToken);
+  const returning = roomMembers(room).find((player) => !player.isBot && player.reconnectToken && player.reconnectToken === reconnectToken);
   if (returning) {
     returning.name = uniquePlayerName(room, cleanName(name, returning.name), returning.id);
     returning.appVersion = cleanVersion(appVersion);
@@ -350,13 +367,14 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion,
     send(socket, { type: "joined", roomId: room.id, playerId: returning.id, reconnectToken: returning.reconnectToken });
     return broadcast(room);
   }
-  if (room.started) {
-    return send(socket, {
-      type: "error",
-      message: "Game already started. Use Rejoin Friends on the same phone to restore your saved seat. Otherwise ask the host to use Bot Offline or Restart Round.",
-    });
+  const active = room.started && !room.winner;
+  if (roomMembers(room).filter(p => !p.isBot).length >= 8) return send(socket, { type: 'error', message: 'Room already has eight human players.' });
+  if (!active && room.players.length >= 8) {
+    const bot = room.players.find(p => p.isBot);
+    if (!bot) return send(socket, { type: 'error', message: 'Room is full.' });
+    room.players.splice(room.players.indexOf(bot), 1); room.teamsChanged = true;
+    room.log.push(`${bot.name} left to make room for a friend.`);
   }
-  if (room.players.length >= 8) return send(socket, { type: "error", message: "Room is full." });
   const player = makePlayer(
     uniquePlayerName(room, requestedName || `Player ${room.players.length + 1}`),
     false,
@@ -366,8 +384,8 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion,
   player.ready = false;
   player.appBuild = Number.isSafeInteger(appBuild) ? appBuild : 0;
   if (room.gameType === "trump") player.team = nextTrumpTeam(room);
-  room.players.push(player);
-  room.log.push(`${player.name} joined.`);
+  if (active) { (room.waitingPlayers ||= []).push(player); room.log.push(`${player.name} joined the lobby for the next game.`); }
+  else { room.players.push(player); room.teamsChanged = true; room.log.push(`${player.name} joined.`); }
   attach(socket, room, player);
   send(socket, { type: "joined", roomId: room.id, playerId: player.id, reconnectToken: player.reconnectToken });
   broadcast(room);
@@ -375,7 +393,7 @@ function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion,
 
 function addBot(room, playerId, difficulty) {
   if (room.hostId !== playerId) return sendToPlayer(room, playerId, "Only the host can add bots.");
-  if (room.started && (room.gameType !== "trump" || !room.winner)) return sendToPlayer(room, playerId, "Bots can only be added before the round starts.");
+  if (room.started && !room.winner) return sendToPlayer(room, playerId, "Bots can only be added in the lobby.");
   if (room.players.length >= 8) return sendToPlayer(room, playerId, "Room is full.");
   const bot = addBotSeat(room, difficulty);
   room.log.push(`${bot.name} (${bot.difficulty}) joined.`);
@@ -384,7 +402,7 @@ function addBot(room, playerId, difficulty) {
 
 function fillBots(room, playerId, target, difficulty) {
   if (room.hostId !== playerId) return sendToPlayer(room, playerId, "Only the host can fill bot seats.");
-  if (room.started && (room.gameType !== "trump" || !room.winner)) return sendToPlayer(room, playerId, "Bots can only be filled before the round starts.");
+  if (room.started && !room.winner) return sendToPlayer(room, playerId, "Bots can only be filled in the lobby.");
   const targetCount = Math.max(2, Math.min(8, Number.isInteger(Number(target)) ? Number(target) : 4));
   if (room.players.length >= targetCount) return sendToPlayer(room, playerId, `Room already has ${targetCount} seat(s).`);
   const before = room.players.length;
@@ -412,6 +430,7 @@ function addBotSeat(room, difficulty) {
   bot.ready = true;
   if (room.gameType === "trump") bot.team = nextTrumpTeam(room);
   room.players.push(bot);
+  room.teamsChanged = true;
   return bot;
 }
 
@@ -454,12 +473,64 @@ function trumpTeamsEqual(room) {
 
 function clearBots(room, playerId) {
   if (room.hostId !== playerId) return sendToPlayer(room, playerId, "Only the host can clear bots.");
-  if (room.started) return sendToPlayer(room, playerId, "Bots can only be cleared before the round starts.");
+  if (room.started && !room.winner) return sendToPlayer(room, playerId, "Bots can only be cleared in the lobby.");
   const before = room.players.length;
   room.players = room.players.filter((player) => !player.isBot);
   const removed = before - room.players.length;
+  if (removed) room.teamsChanged = true;
+  room.players.forEach(p => { if (!p.isBot) p.ready = false; });
   room.log.push(`Host cleared ${removed} bot(s).`);
   broadcast(room);
+}
+
+function roomMembers(room) { return [...room.players, ...(room.waitingPlayers || [])]; }
+
+function removeBot(room, playerId, botId) {
+  if (room.hostId !== playerId || room.started && !room.winner) return sendToPlayer(room, playerId, 'Only the host can remove bots in the lobby.');
+  const bot = room.players.find(p => p.id === botId && p.isBot);
+  if (!bot) return sendToPlayer(room, playerId, 'Choose a bot seat to remove.');
+  room.players.splice(room.players.indexOf(bot), 1); room.teamsChanged = true;
+  room.players.forEach(p => { if (!p.isBot) p.ready = false; });
+  room.log.push(`${bot.name} was removed by the host.`); broadcast(room);
+}
+
+function returnLobby(room, playerId) {
+  if (room.hostId !== playerId) return sendToPlayer(room, playerId, 'Only the host can return everyone to the lobby.');
+  recordNightResult(room); clearTimeout(room.botTimer);
+  if (!room.winner) { room.trump = null; room.teamsChanged = true; }
+  room.started = false; room.winner = null; room.winnerId = null; room.winnerReason = ''; room.turnDeadline = 0;
+  room.centerPile = []; room.activeRank = null; room.lastPlayedMove = null; room.pendingWinnerId = null;
+  const waiting = room.waitingPlayers || [];
+  while (room.players.length + waiting.length > 8 && room.players.some(p => p.isBot)) room.players.splice(room.players.findIndex(p => p.isBot), 1);
+  for (const player of waiting) { player.team = room.gameType === 'trump' ? nextTrumpTeam(room) : null; room.players.push(player); }
+  if (waiting.length) room.teamsChanged = true;
+  room.waitingPlayers = []; room.currentIndex = 0;
+  room.players.forEach(p => { p.hand = []; p.ready = Boolean(p.isBot); });
+  room.log.push('Everyone returned to the lobby. Add friends, remove bots and choose teams.'); broadcast(room);
+}
+
+function callActivity(room) {
+  return { type: 'callActivity', roomId: room.id, participants: roomMembers(room).filter(p => p.callJoined).map(p => ({ id: p.id, name: p.name, muted: Boolean(p.callMuted), speaking: Boolean(p.callSpeaking) })) };
+}
+function broadcastCallActivity(room) {
+  const value = callActivity(room);
+  for (const player of roomMembers(room)) if (player.socket?.readyState === 1) send(player.socket, value);
+}
+function updateCallPresence(socket, message) {
+  const room = rooms.get(String(message.roomId || ''));
+  const player = room && roomMembers(room).find(p => !p.isBot && p.id === message.playerId && p.reconnectToken === message.reconnectToken && p.lastCallTokenAt);
+  if (!player) return send(socket, { type: 'callPresenceError', message: 'Call seat is no longer in the room.' });
+  if (typeof message.joined !== 'boolean' || typeof message.muted !== 'boolean' || typeof message.speaking !== 'boolean') return;
+  const changed = player.callJoined !== message.joined || player.callMuted !== message.muted || player.callSpeaking !== message.speaking;
+  player.callJoined = message.joined; player.callMuted = message.muted; player.callSpeaking = message.joined && !message.muted && message.speaking;
+  player.callExpiresAt = Date.now() + 15000; player.callSocket = socket;
+  socket.callRoomId = room.id; socket.callPlayerId = player.id;
+  if (changed) broadcastCallActivity(room);
+}
+function expireCallPresence(room, now) {
+  let changed = false;
+  for (const player of roomMembers(room)) if (player.callJoined && now >= player.callExpiresAt) { player.callJoined = false; player.callSpeaking = false; changed = true; }
+  if (changed) broadcastCallActivity(room);
 }
 
 function setBotSpeed(room, playerId, speed) {
@@ -550,6 +621,7 @@ function restartRound(room, playerId) {
 
 function startGame(room, playerId, forceRestart = false) {
   if (room.hostId !== playerId) return sendToPlayer(room, playerId, "Only the host can start the game.");
+  if (room.waitingPlayers?.length) return sendToPlayer(room, playerId, 'Return to the lobby first so waiting friends can take their seats.');
   if (room.players.length < 2 || room.players.length > 8) return sendToPlayer(room, playerId, "Need 2 to 8 players.");
   if (room.gameType === "trump" && trumpSeatError(room.players.length)) return sendToPlayer(room, playerId, trumpSeatError(room.players.length));
   if (room.gameType === "trump" && !trumpTeamsEqual(room)) return sendToPlayer(room, playerId, "Choose equal teams before starting.");
@@ -721,7 +793,7 @@ function bluff(room, playerId) {
 }
 
 function sticker(room, playerId, value) {
-  const player = room.players.find((item) => item.id === playerId);
+  const player = roomMembers(room).find((item) => item.id === playerId);
   if (!player) return;
   const sticker = String(value).slice(0, 30);
   room.log.push(`${player.name} sent sticker: ${sticker}`);
@@ -731,7 +803,7 @@ function sticker(room, playerId, value) {
 }
 
 function chat(room, playerId, value) {
-  const player = room.players.find((item) => item.id === playerId);
+  const player = roomMembers(room).find((item) => item.id === playerId);
   if (!player) return;
   const text = String(value || "").replace(/\s+/g, " ").trim().slice(0, 120);
   if (!text) return sendToPlayer(room, playerId, "Enter a message first.");
@@ -785,8 +857,11 @@ function voice(room, playerId, data, requestedDurationMs) {
 
 function leaveRoom(room, socket) {
   const playerId = socket.playerId;
-  const player = room.players.find((item) => item.id === playerId);
+  const player = roomMembers(room).find((item) => item.id === playerId);
   if (!player || player.isBot) return;
+  player.callJoined = false; player.callSpeaking = false; broadcastCallActivity(room);
+  if ((room.waitingPlayers || []).includes(player)) room.waitingPlayers = room.waitingPlayers.filter(p => p !== player);
+  else if (!room.started || room.winner) { room.players = room.players.filter(p => p !== player); room.teamsChanged = true; }
   player.connected = false;
   if (player.socket === socket) player.socket = null;
   socket.roomId = null;
@@ -805,7 +880,7 @@ function leaveRoom(room, socket) {
 function endRoom(room, playerId) {
   if (room.hostId !== playerId) return sendToPlayer(room, playerId, "Only the host can end the room.");
   clearTimeout(room.botTimer);
-  for (const player of room.players) {
+  for (const player of roomMembers(room)) {
     if (player.socket?.readyState === 1) {
       send(player.socket, { type: "roomEnded", message: "Host ended the room." });
       player.socket.roomId = null;
@@ -857,7 +932,7 @@ function broadcast(room) {
   recordNightResult(room);
   room.updatedAt = Date.now();
   if (room.gameType !== 'trump') syncBluffDeadline(room, room.updatedAt);
-  for (const player of room.players) {
+  for (const player of roomMembers(room)) {
     if (player.socket?.readyState === 1) {
       send(player.socket, { type: "state", state: stateFor(room, player) });
     }
@@ -887,7 +962,7 @@ function stateFor(room, viewer) {
   const canStart = room.hostId === viewer.id && (!room.started || Boolean(room.winner)) && room.players.length >= 2
     && (room.gameType !== "trump" || !trumpSeatError(room.players.length))
     && (room.gameType !== "trump" || trumpTeamsEqual(room))
-    && !outdatedTrumpClients(room)
+    && !outdatedTrumpClients(room) && !(room.waitingPlayers || []).length
     && !versionMismatch
     && (readiness.allReady || (!room.winner && hostCanAutoReady(room, viewer.id)));
   return {
@@ -923,7 +998,11 @@ function stateFor(room, viewer) {
     totalKnownCards,
     serverProtocol: SERVER_PROTOCOL,
     serverBuild: SERVER_BUILD,
-    rulesRevision: 106,
+    rulesRevision: 108,
+    waiting: (room.waitingPlayers || []).includes(viewer),
+    waitingPlayers: (room.waitingPlayers || []).map(p => ({ id: p.id, name: p.name, avatarIndex: p.avatarIndex, connected: p.connected })),
+    roomCapacity: 8,
+    callParticipants: callActivity(room).participants,
     ...gameNightState(room),
     versionMismatch,
     versionWarning: versionMismatch ? humanVersions.join(" / ") : "",
@@ -973,6 +1052,7 @@ function stateFor(room, viewer) {
 }
 
 function startBlockReasonFor(room, viewer, readiness, humanVersions, versionMismatch, offlineHumans, unreadyHumans, canStart) {
+  if (room.waitingPlayers?.length && (!room.started || room.winner)) return 'Return to the lobby to seat waiting friends before the next game.';
   if (canStart) return room.winner ? "Ready for rematch. Host can tap Play Again." : "Ready. Host can tap Start Game.";
   if (room.hostId !== viewer.id) {
     const host = room.players.find((player) => player.id === room.hostId);
@@ -1005,7 +1085,7 @@ function attach(socket, room, player) {
 }
 
 function disconnectPlayer(room, socket) {
-  const player = room.players.find(p => p.id === socket.playerId && p.socket === socket);
+  const player = roomMembers(room).find(p => p.id === socket.playerId && p.socket === socket);
   if (!player) return;
   player.connected = false; player.socket = null;
   player.reconnectingUntil = Date.now() + 15000;
@@ -1031,7 +1111,7 @@ function roomReadiness(room) {
 }
 
 function outdatedTrumpClients(room) {
-  return room.gameType === 'trump' && room.players.some(p => !p.isBot && !(p.appBuild >= 105));
+  return room.gameType === 'trump' && room.players.some(p => !p.isBot && !(p.appBuild >= (room.trumpVariant === 'double' ? 108 : 105)));
 }
 
 function humanVersionSet(room) {
@@ -1265,6 +1345,7 @@ function roomSummary(room) {
   const connected = room.players.filter((player) => player.connected).length;
   const host = room.players.find((player) => player.id === room.hostId);
   const canStart = (!room.started || Boolean(room.winner))
+    && !(room.waitingPlayers || []).length
     && room.players.length >= 2
     && (room.gameType !== "trump" || !trumpSeatError(room.players.length) && trumpTeamsEqual(room))
     && Boolean(host?.connected)
@@ -1282,6 +1363,8 @@ function roomSummary(room) {
     phase: room.winner ? "Round over" : room.started ? "Playing" : "Lobby",
     roundNumber: room.roundNumber || 0,
     playerCount: room.players.length,
+    roomCapacity: 8,
+    waitingCount: (room.waitingPlayers || []).length,
     connected,
     connectedCount: connected,
     humanCount: readiness.humanCount,
@@ -1331,6 +1414,7 @@ function roomSummary(room) {
 function roomSummaryStartBlockReason(room, readiness, humanVersions, versionMismatch, offlineHumans, unreadyHumans, canStart) {
   if (canStart) return room.winner ? "Ready for rematch. Host can tap Play Again." : "Ready. Host can tap Start Game.";
   if (room.started && !room.winner) return "Round is already running.";
+  if (room.waitingPlayers?.length) return 'Return to the lobby to seat the waiting friends.';
   if (room.players.length < 2) return "Need at least 2 players or bots.";
   if (room.gameType === "trump" && trumpSeatError(room.players.length)) return trumpSeatError(room.players.length);
   if (room.gameType === "trump" && !trumpTeamsEqual(room)) return "Choose equal teams before starting.";
@@ -1377,7 +1461,7 @@ function send(socket, payload) {
 }
 
 function sendToPlayer(room, playerId, message) {
-  const player = room.players.find((item) => item.id === playerId);
+  const player = roomMembers(room).find((item) => item.id === playerId);
   if (player?.socket?.readyState === 1) {
     send(player.socket, { type: "error", message });
   }
@@ -1405,7 +1489,7 @@ function cleanAvatarIndex(value, name = "Player") {
 
 function uniquePlayerName(room, name, exceptId = "") {
   const base = cleanName(name, "Player");
-  const existing = new Set(room.players
+  const existing = new Set(roomMembers(room)
     .filter((player) => player.id !== exceptId)
     .map((player) => player.name.toLowerCase()));
   if (!existing.has(base.toLowerCase())) return base;

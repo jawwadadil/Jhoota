@@ -30,6 +30,41 @@ function harness(initialTime = 1000) {
   };
 }
 const skip = !existsSync(asset);
+test('host removes individual bots and a friend replaces a bot in a full pregame lobby', { skip }, () => {
+  const h = harness(); h.engine.open('host'); h.send('host', { type: 'create', name: 'Jawwad', appVersion: '0.95', appBuild: 108, gameType: 'trump' });
+  const roomId = h.states.get('host').roomId;
+  h.send('host', { type: 'fillBots', target: 8, difficulty: 'Pro' });
+  h.engine.open('friend'); h.send('friend', { type: 'join', roomId, name: 'Musab', appVersion: '0.95', appBuild: 108 });
+  assert.equal(h.states.get('host').playerCount, 8); assert.equal(h.states.get('friend').waiting, false);
+  const bot = h.states.get('host').players.find(p => p.isBot);
+  h.send('friend', { type: 'removeBot', botId: bot.id }); assert.equal(h.states.get('host').playerCount, 8);
+  h.send('host', { type: 'removeBot', botId: h.states.get('host').playerId }); assert.equal(h.states.get('host').playerCount, 8);
+  h.send('host', { type: 'removeBot', botId: bot.id }); assert.equal(h.states.get('host').playerCount, 7);
+});
+test('active match admits waiting friends privately; same room expands from four to six', { skip }, () => {
+  const h = harness(); h.engine.open('host'); h.send('host', { type: 'create', name: 'Jawwad', appVersion: '0.95', appBuild: 108, gameType: 'trump' });
+  const roomId = h.states.get('host').roomId; h.send('host', { type: 'fillBots', target: 4, difficulty: 'Pro' }); h.send('host', { type: 'start' });
+  for (let i = 0; i < 2; i++) { h.engine.open(`friend${i}`); h.send(`friend${i}`, { type: 'join', roomId, name: `Friend ${i}`, appVersion: '0.95', appBuild: 108 }); }
+  const waiting = h.states.get('friend0'); assert.equal(waiting.waiting, true); assert.deepEqual(waiting.hand, []); assert.deepEqual(waiting.legalCards, []);
+  assert.equal(h.states.get('host').playerCount, 4); assert.equal(h.states.get('host').waitingPlayers.length, 2);
+  h.send('friend0', { type: 'returnLobby' }); assert.equal(h.states.get('host').started, true);
+  h.send('friend0', { type: 'start' }); assert.equal(h.states.get('host').started, true);
+  h.send('friend0', { type: 'chat', value: 'Ready for next game' }); assert.equal(h.states.get('host').chat.at(-1).value, 'Ready for next game');
+  h.send('host', { type: 'returnLobby' }); assert.equal(h.states.get('host').started, false); assert.equal(h.states.get('host').roomId, roomId);
+  assert.equal(h.states.get('host').playerCount, 6); assert.equal(h.states.get('friend0').waiting, false);
+  assert.equal(h.states.get('host').trumpPhase, 'lobby');
+  for (let i = 0; i < 2; i++) h.send(`friend${i}`, { type: 'setReady', ready: true });
+  h.send('host', { type: 'start' }); assert.equal(h.states.get('host').playerCount, 6); assert.equal(h.states.get('host').started, true); assert.equal(h.states.get('host').totalKnownCards, 72);
+});
+test('call presence is seat authenticated, separately connected, and never exposes tokens', { skip }, () => {
+  const h = harness(); h.engine.open('host'); h.send('host', { type: 'create', name: 'Jawwad', appVersion: '0.95', appBuild: 108, gameType: 'bluff' });
+  const identity = h.messages.find(m => m.type === 'created');
+  h.engine.open('call'); h.send('call', { type: 'callPresence', roomId: identity.roomId, playerId: identity.playerId, reconnectToken: 'wrong', joined: true, muted: false, speaking: true });
+  assert(h.messages.some(m => m.id === 'call' && m.type === 'callPresenceError'));
+  // Nearby rooms do not issue LiveKit tokens, so even the genuine seat cannot announce a fabricated call.
+  h.send('call', { type: 'callPresence', roomId: identity.roomId, playerId: identity.playerId, reconnectToken: identity.reconnectToken, joined: true, muted: false, speaking: true });
+  assert.deepEqual(h.states.get('host').callParticipants, []); assert.equal(h.states.get('host').players[0].connected, true);
+});
 test('saving a long-paused game preserves the remaining turn after reopening', { skip }, () => {
   const h = harness(); h.engine.botStart({ gameType: 'bluff', count: 2, name: 'Jawwad', difficulty: 'Pro', speed: 'Slow' }, null);
   h.engine.pause(true);
@@ -86,7 +121,8 @@ test('nearby players share lobby, private hands, voice notes and token-only reco
   h.send('host', { type: 'voice', data: 'AAAAAAAAAAAA', durationMs: 600 }); assert(h.messages.some(m => m.id === 'guest' && m.type === 'voice'));
   const hand = h.states.get('guest').hand; h.engine.close('guest');
   h.engine.open('impostor'); h.send('impostor', { type: 'join', roomId, name: 'Musab', appVersion: '0.95', appBuild: 106 });
-  assert(h.messages.some(m => m.id === 'impostor' && m.type === 'error')); assert(!h.states.has('impostor'));
+  assert.equal(h.states.get('impostor').waiting, true); assert.deepEqual(h.states.get('impostor').hand, []);
+  assert.notEqual(h.states.get('impostor').playerId, seat.playerId);
   h.engine.open('return'); h.send('return', { type: 'join', roomId, name: 'Musab', reconnectToken: seat.reconnectToken, appVersion: '0.95', appBuild: 106 });
   assert.deepEqual(h.states.get('return').hand, hand); assert.equal(h.states.get('return').playerId, seat.playerId);
 });

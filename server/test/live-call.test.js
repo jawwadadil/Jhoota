@@ -31,3 +31,8 @@ test('bots, absent and disconnected players cannot obtain call credentials', () 
   }
   assert.throws(() => liveCallCredentials({ players: [] }, { id: 'stranger', connected: true }, env));
 });
+test('a connected friend waiting for the next game can join the same private call', () => {
+  const p = { id: 'waiting-friend', connected: true }, room = { players: [], waitingPlayers: [p] };
+  const result = liveCallCredentials(room, p, env);
+  assert.equal(JSON.parse(Buffer.from(result.token.split('.')[1], 'base64url')).sub, p.id);
+});

@@ -34,5 +34,16 @@ try {
   assert.notEqual(JSON.parse(Buffer.from(other.token.split('.')[1], 'base64url')).video.room, claims.video.room);
   const before = a.messages.length; a.send({ type: 'liveCallToken' });
   assert.match((await wait(a, 'liveCallError', before)).message, /Wait a moment/);
+  const seat = await wait(a, 'created');
+  const presence = await client(), from = a.messages.length;
+  presence.send({ type: 'callPresence', roomId: state.roomId, playerId: state.playerId, reconnectToken: seat.reconnectToken, joined: true, muted: false, speaking: true });
+  const activity = await wait(a, 'callActivity', from);
+  assert.deepEqual(activity.participants, [{ id: state.playerId, name: 'Call Test A', muted: false, speaking: true }]);
+  assert(!JSON.stringify(activity).includes(seat.reconnectToken));
+  const invalid = await client(); invalid.send({ type: 'callPresence', roomId: state.roomId, playerId: state.playerId, reconnectToken: 'not-the-seat', joined: true, muted: false, speaking: true });
+  await wait(invalid, 'callPresenceError');
+  const leftFrom = a.messages.length; presence.socket.close();
+  assert.deepEqual((await wait(a, 'callActivity', leftFrom)).participants, []);
   console.log('Call page, membership, identity, room isolation and retry limit passed.');
+  console.log('Separate background call presence, speaking badges, token privacy and explicit leave passed.');
 } finally { for (const socket of clients) socket.close(); }

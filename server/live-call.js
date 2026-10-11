@@ -9,7 +9,7 @@ export function liveCallConfigured(env = process.env) {
 
 export function liveCallCredentials(room, player, env = process.env, now = Date.now()) {
   if (!liveCallConfigured(env)) throw new Error('Live calls are not configured on this server yet. Voice notes are still available.');
-  if (!room.players.includes(player) || player.isBot || !player.connected) throw new Error('Join the game room before joining its call.');
+  if (![...room.players, ...(room.waitingPlayers || [])].includes(player) || player.isBot || !player.connected) throw new Error('Join the game room before joining its call.');
   room.callRoomId ||= `jhoota-${randomUUID()}`;
   const seconds = Math.floor(now / 1000);
   // Standard HS256 JWT, signed only on the server; no API secret reaches a phone.

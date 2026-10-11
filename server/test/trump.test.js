@@ -20,6 +20,43 @@ function room(count) {
 }
 function random(seed) { return () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; }; }
 
+function playControlledHand(r, winner, suit) {
+  r.players.forEach((p, i) => { p.hand = [(i === winner ? 'A' : String(i + 2)) + suit]; });
+  for (let i = 0; i < r.players.length; i++) { const p = r.players[r.currentIndex]; assert.equal(playTrump(r, p.id, [p.hand[0]]), ''); }
+}
+test('Double Hand collects only for the same player, then resets the streak', () => {
+  const r = room(4); r.trumpVariant = 'double'; beginTrump(r, random(55)); chooseTrump(r, r.players[r.currentIndex].id, 'H');
+  r.trump.totalTricks = 4;
+  for (const [i, winner] of [0, 0, 0, 1].entries()) {
+    playControlledHand(r, winner, ['H', 'D', 'C', 'S'][i]);
+    assert.equal(r.trump.collectionCount, [0, 2, 0, 2][i]);
+    assert.equal(trumpPublicState(r, r.players[0]).collectedHands, [0, 2, 0, 2][i]);
+    resolve(r);
+  }
+  assert.deepEqual(r.trump.scores, [2, 2]); assert.equal(r.winner, 'Draw');
+  assert.equal(r.trump.pendingPile.length, 0); assert.equal(r.trump.captured.length, 16);
+});
+test('alternating teammates do not collect; final hand collects the entire remaining pile', () => {
+  const r = room(4); r.trumpVariant = 'double'; beginTrump(r, random(51)); chooseTrump(r, r.players[r.currentIndex].id, 'H'); r.trump.totalTricks = 4;
+  for (const [i, winner] of [0, 2, 0, 2].entries()) {
+    playControlledHand(r, winner, ['H', 'D', 'C', 'S'][i]); assert.equal(r.trump.collectionCount, i === 3 ? 4 : 0); resolve(r);
+  }
+  assert.deepEqual(r.trump.scores, [4, 0]); assert.equal(r.winner, 'Team A'); assert.equal(r.trump.coat, true);
+});
+for (const count of [4, 6, 8]) test(`Double Hand ${count}: complete legal games preserve every dealt card`, () => {
+  for (let seed = 1; seed <= 15; seed++) {
+    const r = room(count); r.trumpVariant = 'double'; beginTrump(r, random(seed + 1000)); chooseTrump(r, r.players[r.currentIndex].id, chooseBotTrump(r.players[r.currentIndex]));
+    let moves = 0;
+    while (!r.winner && moves++ < 110) {
+      const p = r.players[r.currentIndex]; assert.equal(playTrump(r, p.id, [chooseBotTrumpCard(r, p)]), '');
+      assert.equal(trumpPublicState(r, p).deckOk, true); resolve(r); assert.equal(trumpPublicState(r, p).deckOk, true);
+    }
+    assert(r.winner); assert.equal(r.trump.pendingPile.length, 0);
+    assert.equal(r.trump.handHistory.reduce((sum, h) => sum + h.collected, 0), r.trump.scores[0] + r.trump.scores[1]);
+    assert.equal(r.trump.captured.length, (r.trump.scores[0] + r.trump.scores[1]) * count);
+  }
+});
+
 for (const count of [4, 6, 8]) {
   test(`${count} players: exactly five visible cards, private reserve, equal complete deal`, () => {
     const r = room(count); beginTrump(r, random(count));
