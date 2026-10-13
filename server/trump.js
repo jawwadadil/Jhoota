@@ -348,12 +348,12 @@ export function chooseBotTrumpCard(room, player, random = Math.random) {
   const hidden = room.trump.hiddenCards[player.id];
   if (cards.length > 1 && hidden) cards = cards.filter(c => c !== hidden);
   if (!cards.length) return undefined;
-  if (player.difficulty === 'Low') return cards[Math.floor(random() * cards.length)];
   const trick = room.trump.trick;
   const rank = card => RANKS.indexOf(cardRank(card));
   const cost = card => rank(card) + (card.endsWith(room.trump.suit) ? 15 : 0);
   const pick = list => list[Math.floor(random() * list.length)];
   if (!trick.length) {
+    if (player.difficulty === 'Low') return pick(cards);
     if (player.difficulty !== 'Pro') return pick(cards);
     // Memory uses public plays, never another player's private hand.
     const history = [...room.trump.trickHistory.flatMap(h => h.cards), ...trick];
@@ -364,20 +364,30 @@ export function chooseBotTrumpCard(room, player, random = Math.random) {
         voids.get(p.playerId).add(hand.leadSuit);
       }
     }
+    const unseen = trumpDeck(room.players.length).filter(c => !player.hand.includes(c) && !history.some(p => p.card === c));
+    const trumpStillOut = unseen.some(c => c.endsWith(room.trump.suit));
     const scored = cards.map(card => {
       const suit = card.slice(-1), isTrump = suit === room.trump.suit;
-      const opponentsVoid = room.players.filter(p => p.team !== player.team && voids.get(p.id)?.has(suit)).length;
-      const unseenHigher = trumpDeck(room.players.length).filter(c => c.endsWith(suit) && rank(c) > rank(card) && !player.hand.includes(c) && !history.some(p => p.card === c)).length;
+      const opponentsVoid = trumpStillOut ? room.players.filter(p => p.team !== player.team && voids.get(p.id)?.has(suit)).length : 0;
+      const unseenHigher = unseen.filter(c => c.endsWith(suit) && rank(c) > rank(card)).length;
       const length = player.hand.filter(c => c.endsWith(suit)).length;
-      return { card, value: (unseenHigher === 0 ? 22 : rank(card)) + length * 2 - (!isTrump ? opponentsVoid * 26 : 5) };
+      const voidRisk = room.trump.cheatingAllowed ? 14 : 30;
+      const exposedHonour = !isTrump && opponentsVoid > 0 && rank(card) >= 8 ? rank(card) * .7 : 0;
+      return { card, value: (unseenHigher === 0 ? 22 : rank(card)) + length * 2 - (!isTrump ? opponentsVoid * voidRisk + exposedHonour : 5) };
     });
     const maximum = Math.max(...scored.map(s => s.value));
     return pick(scored.filter(s => s.value === maximum)).card;
   }
   const best = trickWinner(trick, room.trump.suit);
   const cheapest = list => { const value = Math.min(...list.map(cost)); return pick(list.filter(c => cost(c) === value)); };
-  if (best.team === player.team) return cheapest(cards);
   const winners = cards.filter(card => trickWinner([...trick, { card, playerId: player.id }], room.trump.suit).playerId === player.id);
+  if (best.team === player.team) {
+    // Double Hand can justify overtaking a partner to collect a consecutive win.
+    if (player.difficulty !== 'Low' && room.trump.variant === 'double'
+        && room.trump.previousWinnerId === player.id && best.playerId !== player.id && winners.length) return cheapest(winners);
+    return cheapest(cards);
+  }
+  if (player.difficulty === 'Low') return pick(cards);
   return cheapest(winners.length ? winners : cards);
 }
 

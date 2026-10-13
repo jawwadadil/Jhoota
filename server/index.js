@@ -4,6 +4,7 @@ import os from "os";
 import { readFileSync } from "node:fs";
 import { randomUUID } from 'node:crypto';
 import { setSeries, beginSeriesGame, recordNightResult, gameNightState } from './game-night.js';
+import { bluffBotPersonality, bluffChallengeChance, bluffPassChance, bluffThinkingDelay } from "./bluff-ai.js";
 import { liveCallConfigured, liveCallCredentials } from "./live-call.js";
 import { beginTrump, chooseTrump, playTrump, trumpPublicState, trumpSeatError, takeTrumpBotTurn, callTrumpToss, selectTrumpCaller, reviewTrumpHand, requestTrumpRedeal, catchTrumpCheat, advanceTrump, extendTrumpTurn, TURN_MS, EXTENSION_MS } from "./trump.js";
 
@@ -39,7 +40,7 @@ const httpServer = http.createServer((request, response) => {
       name: SERVER_NAME,
       serverProtocol: SERVER_PROTOCOL,
       serverBuild: SERVER_BUILD,
-      rulesRevision: 108,
+      rulesRevision: 108, botRevision: 111,
       heartbeatMs: HEARTBEAT_MS,
       roomTtlMinutes: Math.round(ROOM_TTL_MS / 60000),
       uptimeSeconds: Math.floor(process.uptime()),
@@ -658,6 +659,7 @@ function startGame(room, playerId, forceRestart = false) {
   room.lastPlayedMove = null;
   room.pendingWinnerId = null;
   room.lastBluffResult = "";
+  room.botChallengeHistory = [];
   room.winnerReason = "";
   room.consecutivePasses = 0;
   room.currentIndex = Math.floor(Math.random() * room.players.length);
@@ -781,6 +783,7 @@ function bluff(room, playerId) {
       room.pendingWinnerId = null;
     }
   }
+  room.botChallengeHistory = [...(room.botChallengeHistory || []), { targetId: accused.id, callerId: caller.id, guilty: !honest }].slice(-24);
   room.centerPile = [];
   room.activeRank = null;
   room.lastPlayedMove = null;
@@ -998,7 +1001,7 @@ function stateFor(room, viewer) {
     totalKnownCards,
     serverProtocol: SERVER_PROTOCOL,
     serverBuild: SERVER_BUILD,
-    rulesRevision: 108,
+    rulesRevision: 108, botRevision: 111,
     waiting: (room.waitingPlayers || []).includes(viewer),
     waitingPlayers: (room.waitingPlayers || []).map(p => ({ id: p.id, name: p.name, avatarIndex: p.avatarIndex, connected: p.connected })),
     roomCapacity: 8,
@@ -1149,7 +1152,7 @@ function runBots(room) {
       return;
     }
     takeBotTurn(room, bot);
-  }, room.botSpeedMs || 650);
+  }, bluffThinkingDelay(room.botSpeedMs || 650, currentPlayer(room)?.difficulty || 'Medium'));
 }
 
 function takeBotTurn(room, bot) {
@@ -1168,29 +1171,17 @@ function takeBotTurn(room, bot) {
   play(room, bot.id, cards, rank);
 }
 
-function shouldBotCallBluff(room, bot) {
-  if (!room.lastPlayedMove) return false;
-  const count = room.lastPlayedMove.cards.length;
-  const claimedRank = room.lastPlayedMove.claimedRank;
-  const ownClaimedRank = cardsOfRank(bot, claimedRank).length;
-  const impossibleClaim = ownClaimedRank + count > 4;
-  const finalClaim = room.pendingWinnerId === room.lastPlayedMove.playerId;
-  if (bot.difficulty === "Pro" && impossibleClaim) return true;
-  let chance = bot.difficulty === "Pro" ? 18 : bot.difficulty === "Medium" ? 11 : 6;
-  if (count >= 3) chance += bot.difficulty === "Pro" ? 36 : bot.difficulty === "Medium" ? 24 : 8;
-  if (impossibleClaim) chance += bot.difficulty === "Pro" ? 65 : bot.difficulty === "Medium" ? 45 : 16;
-  if (ownClaimedRank >= 3 && count >= 2) chance += bot.difficulty === "Pro" ? 26 : bot.difficulty === "Medium" ? 16 : 4;
-  if (finalClaim) chance += bot.difficulty === "Pro" ? 24 : bot.difficulty === "Medium" ? 16 : 8;
-  if (bot.hand.length <= 2) chance -= 6;
-  return Math.random() * 100 < chance;
+function bluffBotInfo(room, bot) {
+  return { hand: bot.hand, botId: bot.id, difficulty: bot.difficulty, rank: room.activeRank || room.lastPlayedMove?.claimedRank,
+    count: room.lastPlayedMove?.cards.length || 0, targetId: room.lastPlayedMove?.playerId,
+    pileCount: room.centerPile.length, finalClaim: Boolean(room.pendingWinnerId && room.pendingWinnerId === room.lastPlayedMove?.playerId),
+    history: room.botChallengeHistory || [] };
 }
-
+function shouldBotCallBluff(room, bot) {
+  return Boolean(room.lastPlayedMove) && Math.random() < bluffChallengeChance(bluffBotInfo(room, bot));
+}
 function shouldBotPass(room, bot) {
-  if (cardsOfRank(bot, room.activeRank).length > 0) return false;
-  let chance = bot.difficulty === "Pro" ? 52 : bot.difficulty === "Medium" ? 34 : 16;
-  if (room.centerPile.length >= 6) chance += bot.difficulty === "Pro" ? 14 : bot.difficulty === "Medium" ? 8 : 0;
-  if (bot.hand.length <= 2) chance += 10;
-  return Math.random() * 100 < chance;
+  return Math.random() < bluffPassChance(bluffBotInfo(room, bot));
 }
 
 function chooseBotRank(bot) {
@@ -1227,7 +1218,12 @@ function chooseBotCards(room, bot, rank) {
     } else if (!room.activeRank && bot.difficulty === "Pro" && matching.length > minimum && Math.random() < 0.35) {
       count = Math.min(matching.length, minimum + 1);
     }
-    return matching.slice(0, Math.min(count, matching.length));
+    const result = matching.slice(0, Math.min(count, matching.length));
+    const spare = bot.hand.filter(c => rankOf(c) !== rank);
+    const mixedChance = bot.difficulty === 'Pro' ? .055 : bot.difficulty === 'Medium' ? .08 : .13;
+    const style = bluffBotPersonality(bot.id) === 'bold' ? 1.25 : .85;
+    if (result.length >= 2 && spare.length && Math.random() < mixedChance * style) result[result.length - 1] = chooseBluffCards(bot, rank, 1)[0];
+    return result;
   }
   const bluffChance = bot.difficulty === "Pro" ? 42 : bot.difficulty === "Medium" ? 66 : 86;
   if (Math.random() * 100 >= bluffChance) return [];
