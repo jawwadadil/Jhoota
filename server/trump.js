@@ -327,6 +327,8 @@ export function trumpPublicState(room, viewer) {
     canExtendTurn: Boolean(t && room.started && !room.winner && ['choose', 'play'].includes(t.phase) && t.deadline > Date.now() && room.players[room.currentIndex]?.id === viewer.id && !viewer.isBot && !t.extensions.includes(viewer.id)),
     deckCount: room.players.length === 4 ? 1 : 2,
     completedTricks: t?.completedTricks || 0, trick: t?.trick || [],
+    currentHandNumber: t ? Math.min(t.totalTricks, t.completedTricks + (t.phase === 'reveal' ? 0 : 1)) : 0,
+    currentTrickLeaderId: t?.trick.length ? trickWinner(t.trick, t.suit).playerId : '',
     handWins: (t?.resultPlayers || room.players.map(p => ({ playerId: p.id, name: p.name, avatarIndex: p.avatarIndex, team: p.team }))).map(p => ({ ...p, handsWon: t?.handWins?.[p.playerId] || 0 })),
     handHistory: t?.handHistory || [], trickHistory: t?.trickHistory || [],
     baapPlayerIds: room.winner && most > 0 ? Object.keys(t.handWins).filter(id => t.handWins[id] === most) : [],

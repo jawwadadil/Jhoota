@@ -3,6 +3,7 @@ import http from "http";
 import os from "os";
 import { readFileSync } from "node:fs";
 import { randomUUID } from 'node:crypto';
+import * as cloud from './profile-store.js';
 import { setSeries, beginSeriesGame, recordNightResult, gameNightState } from './game-night.js';
 import { bluffBotPersonality, bluffChallengeChance, bluffPassChance, bluffThinkingDelay } from "./bluff-ai.js";
 import { liveCallConfigured, liveCallCredentials } from "./live-call.js";
@@ -25,6 +26,7 @@ const MAX_VOICE_AUDIO_BYTES = 180_000;
 const MAX_VOICE_BASE64_CHARS = Math.ceil(MAX_VOICE_AUDIO_BYTES / 3) * 4;
 
 const httpServer = http.createServer((request, response) => {
+  if (request.url?.startsWith('/api/')) { void cloud.profileApi(request, response, rooms); return; }
   if (request.url === '/call' || request.url === '/call-client.js') {
     const file = request.url === '/call' ? 'call.html' : 'call-client.js';
     response.writeHead(200, { 'content-type': file.endsWith('.html') ? 'text/html; charset=utf-8' : 'text/javascript; charset=utf-8',
@@ -41,6 +43,7 @@ const httpServer = http.createServer((request, response) => {
       serverProtocol: SERVER_PROTOCOL,
       serverBuild: SERVER_BUILD,
       rulesRevision: 108, botRevision: 111,
+      presentationRevision: 112, profiles: cloud.profileHealth(),
       heartbeatMs: HEARTBEAT_MS,
       roomTtlMinutes: Math.round(ROOM_TTL_MS / 60000),
       uptimeSeconds: Math.floor(process.uptime()),
@@ -85,6 +88,7 @@ const httpServer = http.createServer((request, response) => {
     });
   }
   if (request.url === "/rooms") {
+    if (cloud.profileHealth().configured) { response.writeHead(403, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: 'Online rooms use private invites.' })); return; }
     return json(response, {
       rooms: [...rooms.values()].map((room) => roomSummary(room)),
     });
@@ -206,6 +210,7 @@ function handle(socket, message) {
   if (!room) return send(socket, { type: "error", message: "Join a room first." });
   const seat = roomMembers(room).find(p => p.id === socket.playerId && p.socket === socket);
   if (!seat) return send(socket, { type: 'error', message: 'Reconnect to your room first.' });
+  if (message.type === 'authenticatePlayer') return authenticatePlayer(room, seat, socket, message.token);
   if ((room.waitingPlayers || []).includes(seat) && !['leave', 'liveCallToken', 'chat', 'sticker'].includes(message.type)) return send(socket, { type: 'error', message: 'You are waiting for the next game. The current deal stays unchanged.' });
   if (message.type === 'returnLobby') return returnLobby(room, socket.playerId);
   if (message.type === 'removeBot') return removeBot(room, socket.playerId, message.botId);
@@ -338,6 +343,26 @@ function createRoom(socket, name, avatarIndex, appVersion, gameType, appBuild, r
   attach(socket, room, player);
   send(socket, { type: "created", roomId, playerId: player.id, reconnectToken: player.reconnectToken });
   broadcast(room);
+}
+
+async function authenticatePlayer(room, seat, socket, token) {
+  if (socket.profileAuthPending) return;
+  if (socket.profileAuthAt && Date.now() - socket.profileAuthAt < 10000) return send(socket, { type: 'profileError', message: 'Please wait a moment before reconnecting your record.' });
+  socket.profileAuthAt = Date.now(); socket.profileAuthPending = true;
+  try {
+    const uid = await cloud.verifyPlayer(token);
+    if (socket.readyState !== 1 || seat.socket !== socket) return;
+    if (roomMembers(room).some(p => p !== seat && p.accountUid === uid)) throw Error('This account already has a seat.');
+    if (seat.accountUid && seat.accountUid !== uid) throw Error('Reconnect with the same account.');
+    const league = await cloud.connectProfile(uid, seat.name, seat.avatarIndex);
+    if (socket.readyState !== 1 || seat.socket !== socket) return;
+    seat.accountUid = uid; if (seat.id === room.hostId || !room.leagueId) room.leagueId = league;
+    send(socket, { type: 'profileConnected' }); broadcast(room);
+  } catch {
+    send(socket, { type: 'profileError', message: 'Your friends record could not connect. Guest play is still available; retry sign-in before the next game.' });
+  } finally {
+    socket.profileAuthPending = false;
+  }
 }
 
 function joinRoom(socket, roomId, name, avatarIndex, reconnectToken, appVersion, appBuild) {
@@ -651,6 +676,8 @@ function startGame(room, playerId, forceRestart = false) {
   room.roundNumber = (room.roundNumber || 0) + 1;
   room.matchId = `${room.id}-${Date.now()}-${room.roundNumber}`;
   room.matchPlayerIds = room.players.map(p => p.id);
+  room.matchAccounts = room.players.map(p => ({ id: p.id, uid: p.accountUid || '', name: p.name, avatarIndex: p.avatarIndex, team: p.team, isBot: Boolean(p.isBot) }));
+  cloud.admitLeaguePlayers(room);
   room.turnExtensions = [];
   room.winner = null;
   room.winnerId = null;
@@ -933,6 +960,7 @@ function testSetup(room, playerId, message) {
 
 function broadcast(room) {
   recordNightResult(room);
+  cloud.recordProfileResult(room);
   room.updatedAt = Date.now();
   if (room.gameType !== 'trump') syncBluffDeadline(room, room.updatedAt);
   for (const player of roomMembers(room)) {
@@ -986,6 +1014,7 @@ function stateFor(room, viewer) {
     roundNumber: room.roundNumber || 0,
     matchId: room.matchId || '',
     matchPlayerIds: room.matchPlayerIds || [],
+    rankedFriends: Boolean(room.leagueId && room.matchAccounts?.length >= 2 && room.matchAccounts.every(p => !p.isBot && p.uid)),
     playerCount: room.players.length,
     connectedCount,
     offlineHumanCount,
@@ -1033,6 +1062,7 @@ function stateFor(room, viewer) {
       .join(" | "),
     players: room.players.map((player) => ({
       id: player.id,
+      accountUid: player.accountUid || '',
       name: player.name,
       avatarIndex: player.avatarIndex,
       cardCount: player.hand.length,
