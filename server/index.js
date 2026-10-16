@@ -24,6 +24,9 @@ const TEST_COMMANDS = process.env.ENABLE_TEST_COMMANDS === "1";
 const MAX_VOICE_DURATION_MS = 6000;
 const MAX_VOICE_AUDIO_BYTES = 180_000;
 const MAX_VOICE_BASE64_CHARS = Math.ceil(MAX_VOICE_AUDIO_BYTES / 3) * 4;
+const HOST_GRACE_MS = 15000;
+const hostTimers = new WeakMap(), bubbleTimers = new WeakMap();
+const STICKERS = new Set(['yey-lay', 'two-j', 'maalik', 'ghup-ghup', 'nahi-yar', 'laugh', 'side-eye', 'shocked', 'wink', 'cry', 'applause', 'Nice try!', 'Good play!', 'I doubt it', 'Caught!', 'Big bluff!']);
 
 const httpServer = http.createServer((request, response) => {
   if (request.url?.startsWith('/api/')) { void cloud.profileApi(request, response, rooms); return; }
@@ -43,7 +46,7 @@ const httpServer = http.createServer((request, response) => {
       serverProtocol: SERVER_PROTOCOL,
       serverBuild: SERVER_BUILD,
       rulesRevision: 108, botRevision: 111,
-      presentationRevision: 112, profiles: cloud.profileHealth(),
+      presentationRevision: 113, profiles: cloud.profileHealth(),
       heartbeatMs: HEARTBEAT_MS,
       roomTtlMinutes: Math.round(ROOM_TTL_MS / 60000),
       uptimeSeconds: Math.floor(process.uptime()),
@@ -117,6 +120,7 @@ setInterval(() => {
   for (const [roomId, room] of rooms) {
     const hasConnectedHuman = roomMembers(room).some((player) => !player.isBot && (player.connected || player.callJoined));
     if (!hasConnectedHuman && now - (room.updatedAt || now) > ROOM_TTL_MS) {
+      clearRoomTimers(room);
       rooms.delete(roomId);
     }
   }
@@ -151,7 +155,7 @@ const turnTimer = setInterval(() => {
   }
 }, 250);
 
-server.on("close", () => { clearInterval(heartbeatTimer); clearInterval(turnTimer); });
+server.on("close", () => { clearInterval(heartbeatTimer); clearInterval(turnTimer); for (const room of rooms.values()) clearRoomTimers(room); });
 
 let shuttingDown = false;
 function shutdown(signal) {
@@ -160,6 +164,7 @@ function shutdown(signal) {
   console.log(`${signal} received. Closing Jhoota connections.`);
   clearInterval(heartbeatTimer);
   clearInterval(turnTimer);
+  for (const room of rooms.values()) clearRoomTimers(room);
   for (const socket of server.clients) {
     socket.close(1012, "server restarting");
   }
@@ -274,6 +279,7 @@ function handle(socket, message) {
   if (message.type === "replaceOfflineWithBot") return replaceOfflineWithBot(room, socket.playerId);
   if (message.type === "skipOfflineTurn") return skipOfflineTurn(room, socket.playerId);
   if (message.type === "claimHost") return claimHost(room, socket.playerId);
+  if (message.type === 'transferHost') return transferHost(room, socket.playerId, message.targetId || message.playerId);
   if (message.type === "chooseTeam" || message.type === "shuffleTeams") return changeTrumpTeams(room, socket.playerId, message);
   if (message.type === "chooseTrump") {
     if (room.gameType !== "trump") return sendToPlayer(room, socket.playerId, "This is a Bluff table.");
@@ -292,8 +298,8 @@ function handle(socket, message) {
   if (message.type === "pass") return pass(room, socket.playerId);
   if (message.type === "bluff") return bluff(room, socket.playerId);
   if (message.type === "testSetup") return testSetup(room, socket.playerId, message);
-  if (message.type === "sticker") return sticker(room, socket.playerId, message.value || "Nice try!");
-  if (message.type === "chat") return chat(room, socket.playerId, message.value || "");
+  if (message.type === "sticker") return sticker(room, socket.playerId, message.value, message.eventId || message.id);
+  if (message.type === "chat") return chat(room, socket.playerId, message.value, message.eventId || message.id);
   if (message.type === "voice") return voice(room, socket.playerId, message.data, message.durationMs);
   if (message.type === 'liveCallToken') {
     const player = roomMembers(room).find(p => p.id === socket.playerId && p.socket === socket);
@@ -589,12 +595,67 @@ function setReady(room, playerId, ready) {
 
 function claimHost(room, playerId) {
   const player = room.players.find((item) => item.id === playerId);
-  const currentHost = room.players.find((item) => item.id === room.hostId);
-  if (!player || player.isBot) return;
-  if (currentHost && currentHost.connected) return sendToPlayer(room, playerId, "Current host is still connected.");
-  room.hostId = playerId;
-  room.log.push(`${player.name} claimed host.`);
+  if (!hostState(room, player).canClaimHost) return sendToPlayer(room, playerId, 'Host is connected or still reconnecting.');
+  assignHost(room, player);
   broadcast(room);
+}
+
+function eligibleHost(player) {
+  return Boolean(player && !player.isBot && player.connected && player.socket?.readyState === 1);
+}
+
+function hostState(room, viewer, now = Date.now()) {
+  const host = room.players.find(p => p.id === room.hostId && !p.isBot);
+  const connected = eligibleHost(host);
+  const hostGraceUntil = !connected && host && room.hostGraceUntil > now ? room.hostGraceUntil : 0;
+  return {
+    hostStatus: connected ? 'connected' : hostGraceUntil ? 'reconnecting' : 'unavailable',
+    hostGraceUntil,
+    canClaimHost: !connected && !hostGraceUntil && room.players.includes(viewer) && eligibleHost(viewer),
+  };
+}
+
+function clearHostTimer(room) {
+  clearTimeout(hostTimers.get(room)); hostTimers.delete(room);
+}
+
+function assignHost(room, player) {
+  clearHostTimer(room); room.hostGraceUntil = 0;
+  if (room.hostId === player.id) return false;
+  room.hostId = player.id; room.log.push(`${player.name} is now host.`);
+  return true;
+}
+
+function repairHost(room) {
+  const status = hostState(room);
+  if (status.hostStatus === 'connected') { clearHostTimer(room); room.hostGraceUntil = 0; return false; }
+  if (status.hostGraceUntil) {
+    if (!hostTimers.has(room)) {
+      const timer = setTimeout(() => {
+        hostTimers.delete(room);
+        if (rooms.get(room.id) !== room) return;
+        repairHost(room); broadcast(room);
+      }, status.hostGraceUntil - Date.now());
+      timer.unref?.(); hostTimers.set(room, timer);
+    }
+    return false;
+  }
+  clearHostTimer(room); room.hostGraceUntil = 0;
+  const next = room.players.find(eligibleHost);
+  return next ? assignHost(room, next) : false;
+}
+
+function transferHost(room, actorId, targetId) {
+  const actor = room.players.find(p => p.id === actorId);
+  const target = room.players.find(p => p.id === targetId);
+  if (room.hostId !== actorId || !eligibleHost(actor)) return sendToPlayer(room, actorId, 'Only the connected host can transfer host.');
+  if (!eligibleHost(target)) return sendToPlayer(room, actorId, 'Choose a connected seated human player.');
+  assignHost(room, target); broadcast(room);
+}
+
+function clearRoomTimers(room) {
+  clearTimeout(room.botTimer); clearHostTimer(room);
+  clearTimeout(bubbleTimers.get(room)); bubbleTimers.delete(room);
 }
 
 function kickOffline(room, playerId) {
@@ -677,6 +738,7 @@ function startGame(room, playerId, forceRestart = false) {
   room.matchId = `${room.id}-${Date.now()}-${room.roundNumber}`;
   room.matchPlayerIds = room.players.map(p => p.id);
   room.matchAccounts = room.players.map(p => ({ id: p.id, uid: p.accountUid || '', name: p.name, avatarIndex: p.avatarIndex, team: p.team, isBot: Boolean(p.isBot) }));
+  room.matchLeagueId = room.leagueId || '';
   cloud.admitLeaguePlayers(room);
   room.turnExtensions = [];
   room.winner = null;
@@ -822,22 +884,47 @@ function bluff(room, playerId) {
   runBots(room);
 }
 
-function sticker(room, playerId, value) {
-  const player = roomMembers(room).find((item) => item.id === playerId);
-  if (!player) return;
-  const sticker = String(value).slice(0, 30);
-  room.log.push(`${player.name} sent sticker: ${sticker}`);
-  room.chat.push({ name: player.name, value: sticker });
-  room.chat = room.chat.slice(-20);
-  broadcast(room);
+function sticker(room, playerId, value, eventId) {
+  return socialMessage(room, playerId, 'sticker', value, eventId);
 }
 
-function chat(room, playerId, value) {
-  const player = roomMembers(room).find((item) => item.id === playerId);
-  if (!player) return;
-  const text = String(value || "").replace(/\s+/g, " ").trim().slice(0, 120);
-  if (!text) return sendToPlayer(room, playerId, "Enter a message first.");
-  room.chat.push({ name: player.name, value: text });
+function chat(room, playerId, value, eventId) {
+  return socialMessage(room, playerId, 'text', value, eventId);
+}
+
+function freshTableBubbles(room, now = Date.now()) {
+  return (room.tableBubbles || []).filter(b => b.expiresAt > now).slice(-16);
+}
+
+function scheduleBubbleExpiry(room) {
+  clearTimeout(bubbleTimers.get(room)); bubbleTimers.delete(room);
+  room.tableBubbles = freshTableBubbles(room);
+  if (!room.tableBubbles.length) return;
+  const timer = setTimeout(() => {
+    bubbleTimers.delete(room);
+    if (rooms.get(room.id) !== room) return;
+    scheduleBubbleExpiry(room); broadcast(room);
+  }, Math.max(1, Math.min(...room.tableBubbles.map(b => b.expiresAt)) - Date.now()));
+  timer.unref?.(); bubbleTimers.set(room, timer);
+}
+
+function socialMessage(room, playerId, kind, value, eventId) {
+  const player = roomMembers(room).find(p => p.id === playerId);
+  if (!eligibleHost(player)) return;
+  const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+  if (kind === 'sticker' && !STICKERS.has(text)) return sendToPlayer(room, playerId, 'Choose a valid sticker.');
+  if (!text) return sendToPlayer(room, playerId, 'Enter a message first.');
+  const dedupeKey = typeof eventId === 'string' && eventId.length > 0 && eventId.length <= 80 ? JSON.stringify([player.id, kind, eventId]) : '';
+  if (dedupeKey && room.socialEventIds?.includes(dedupeKey)) return;
+  const now = Date.now(), cooldownKey = kind === 'sticker' ? 'lastStickerAt' : 'lastChatAt';
+  if (player[cooldownKey] != null && now - player[cooldownKey] < (kind === 'sticker' ? 2000 : 1000)) return sendToPlayer(room, playerId, 'Wait a moment before sending another message.');
+  player[cooldownKey] = now;
+  if (dedupeKey) room.socialEventIds = [...(room.socialEventIds || []), dedupeKey].slice(-64);
+  const cleanValue = kind === 'text' ? text.slice(0, 120) : text;
+  const bubble = { id: randomUUID(), playerId: player.id, name: player.name, avatarIndex: player.avatarIndex, kind, value: cleanValue, createdAt: now, expiresAt: now + (kind === 'sticker' ? 2800 : 5000) };
+  room.tableBubbles = [...freshTableBubbles(room, now).filter(b => b.playerId !== player.id), bubble].slice(-16);
+  scheduleBubbleExpiry(room);
+  room.chat.push({ id: bubble.id, playerId: player.id, name: player.name, kind, value: cleanValue, createdAt: now });
   room.chat = room.chat.slice(-20);
   room.log.push(`${player.name} chatted.`);
   broadcast(room);
@@ -898,18 +985,14 @@ function leaveRoom(room, socket) {
   socket.playerId = null;
   room.log.push(`${player.name} left the room.`);
   if (room.hostId === playerId) {
-    const nextHost = room.players.find((item) => !item.isBot && item.connected);
-    if (nextHost) {
-      room.hostId = nextHost.id;
-      room.log.push(`${nextHost.name} is now host.`);
-    }
+    clearHostTimer(room); room.hostGraceUntil = 0; repairHost(room);
   }
   broadcast(room);
 }
 
 function endRoom(room, playerId) {
   if (room.hostId !== playerId) return sendToPlayer(room, playerId, "Only the host can end the room.");
-  clearTimeout(room.botTimer);
+  clearRoomTimers(room);
   for (const player of roomMembers(room)) {
     if (player.socket?.readyState === 1) {
       send(player.socket, { type: "roomEnded", message: "Host ended the room." });
@@ -1001,6 +1084,7 @@ function stateFor(room, viewer) {
     gameType: room.gameType,
     playerId: viewer.id,
     hostId: room.hostId,
+    ...hostState(room, viewer),
     started: room.started,
     activeRank: room.activeRank,
     minimumOpeningCards: room.minimumOpeningCards,
@@ -1014,7 +1098,7 @@ function stateFor(room, viewer) {
     roundNumber: room.roundNumber || 0,
     matchId: room.matchId || '',
     matchPlayerIds: room.matchPlayerIds || [],
-    rankedFriends: Boolean(room.leagueId && room.matchAccounts?.length >= 2 && room.matchAccounts.every(p => !p.isBot && p.uid)),
+    rankedFriends: Boolean((room.matchLeagueId ?? room.leagueId) && room.matchAccounts?.length >= 2 && room.matchAccounts.every(p => !p.isBot && p.uid)),
     playerCount: room.players.length,
     connectedCount,
     offlineHumanCount,
@@ -1030,7 +1114,7 @@ function stateFor(room, viewer) {
     totalKnownCards,
     serverProtocol: SERVER_PROTOCOL,
     serverBuild: SERVER_BUILD,
-    rulesRevision: 108, botRevision: 111,
+    rulesRevision: 108, botRevision: 111, presentationRevision: 113,
     waiting: (room.waitingPlayers || []).includes(viewer),
     waitingPlayers: (room.waitingPlayers || []).map(p => ({ id: p.id, name: p.name, avatarIndex: p.avatarIndex, connected: p.connected })),
     roomCapacity: 8,
@@ -1079,6 +1163,7 @@ function stateFor(room, viewer) {
     hand: viewer.hand,
     log: room.log.slice(-14),
     chat: (room.chat || []).slice(-12),
+    tableBubbles: freshTableBubbles(room).map(b => ({ ...b })),
     latestEvent: room.log.at(-1) || "",
     ...(room.gameType === "trump" ? { ...trumpPublicState(room, viewer), canBluff: false } : {}),
   };
@@ -1110,25 +1195,27 @@ function startBlockReasonFor(room, viewer, readiness, humanVersions, versionMism
 }
 
 function attach(socket, room, player) {
+  // Resolve an expired host before attaching a late creator, so a replacement keeps ownership.
+  repairHost(room);
   socket.roomId = room.id;
   socket.playerId = player.id;
   player.socket = socket;
   player.connected = true;
   player.reconnectingUntil = 0;
+  repairHost(room);
 }
 
 function disconnectPlayer(room, socket) {
   const player = roomMembers(room).find(p => p.id === socket.playerId && p.socket === socket);
   if (!player) return;
   player.connected = false; player.socket = null;
-  player.reconnectingUntil = Date.now() + 15000;
+  player.reconnectingUntil = Date.now() + HOST_GRACE_MS;
   if (room.started && !room.winner && currentPlayer(room).id === player.id) {
     if (room.trump?.deadline) room.trump.deadline = Math.max(room.trump.deadline, player.reconnectingUntil);
     else if (room.turnDeadline) room.turnDeadline = Math.max(room.turnDeadline, player.reconnectingUntil);
   }
   if (room.hostId === player.id) {
-    const next = room.players.find(p => !p.isBot && p.connected);
-    if (next) { room.hostId = next.id; room.log.push(`${next.name} is now host.`); }
+    room.hostGraceUntil = player.reconnectingUntil; repairHost(room);
   }
   broadcast(room);
 }

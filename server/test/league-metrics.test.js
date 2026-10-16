@@ -18,6 +18,13 @@ test('Finished snapshot remains unchanged during rematch',()=>{
  const r=room(),result=verifiedResult(r);r.matchAccounts[0].name='Changed';r.trump.handWins.a=0;
  assert.equal(result.players[0].name,'Alice');assert.equal(result.players[0].hands,6);
 });
+
+test('Host changes cannot redirect a result away from the original match league', () => {
+ const r = room(); r.matchLeagueId = 'original-club'; r.leagueId = 'replacement-club';
+ assert.equal(verifiedResult(r).leagueId, 'original-club');
+ r.leagueId = ''; assert.equal(verifiedResult(r).leagueId, 'original-club');
+ r.matchLeagueId = ''; r.leagueId = 'late-sign-in'; assert.equal(verifiedResult(r), null);
+});
 test('Individual Trump hands and Baap differ from team collections',()=>{
  const result=verifiedResult(room());assert.equal(result.players[0].hands,6);assert.equal(result.players[0].baap,true);
  assert.equal(result.players[1].hands,3);assert.equal(result.players[1].win,false);

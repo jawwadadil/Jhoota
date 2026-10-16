@@ -142,7 +142,7 @@
       }
       for (const room of rooms.values()) broadcast(room);
     },
-    stop() { for (const room of rooms.values()) clearTimeout(room.botTimer); rooms.clear(); sockets.clear(); paused = true; },
+    stop() { for (const room of rooms.values()) clearRoomTimers(room); rooms.clear(); sockets.clear(); paused = true; },
     exportSnapshot() { return snapshot(); },
   };
   bridge.ready();

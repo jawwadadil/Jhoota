@@ -16,7 +16,8 @@ export function addResult(old, result) {
 
 // Capture server-owned results before a rematch can replace the deal.
 export function verifiedResult(room) {
-  if (!room.winner || !room.matchId || !room.leagueId || !room.matchAccounts || room.players.some(p => p.isBot)) return null;
+  const leagueId = room.matchLeagueId ?? room.leagueId;
+  if (!room.winner || !room.matchId || !leagueId || !room.matchAccounts || room.players.some(p => p.isBot)) return null;
   const seats = room.matchAccounts;
   if (seats.length < 2 || seats.some(p => p.isBot || !p.uid) || new Set(seats.map(p => p.uid)).size !== seats.length) return null;
   const mode = room.gameType === 'trump' ? 'trump' : 'bluff';
@@ -24,7 +25,7 @@ export function verifiedResult(room) {
   const hands = room.trump?.handWins || {};
   const most = Math.max(0, ...Object.values(hands));
   return {
-    id: room.matchId, leagueId: room.leagueId, mode, finishedAt: Date.now(),
+    id: room.matchId, leagueId, mode, finishedAt: Date.now(),
     winner: room.winner, scores: [...(room.trump?.scores || [])], variant: room.trump?.variant || '',
     players: seats.map(p => ({ uid: p.uid, name: p.name, avatar: p.avatarIndex, team: p.team,
       win: !draw && (mode === 'trump' ? p.team === room.trump.winnerTeam : p.id === room.winnerId),

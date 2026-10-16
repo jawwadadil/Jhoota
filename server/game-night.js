@@ -11,19 +11,36 @@ export function setSeries(room, actor, length) {
 
 export function beginSeriesGame(room) {
   const roster = room.players.map(p => `${p.id}:${room.gameType === 'trump' ? p.team : '-'}`).sort().join('|');
+  if (room.gameType === 'trump') {
+    const teamRoster = JSON.stringify(room.players.map(p => [p.id, p.team, p.isBot === true]).sort((a, b) => a[0].localeCompare(b[0])));
+    if (!room.teamMatchTally || room.teamMatchTally.roster !== teamRoster) {
+      room.teamContestNumber = (room.teamContestNumber || 0) + 1;
+      room.teamMatchTally = { roster: teamRoster, contestId: `${room.nightId || room.id}-teams-${room.teamContestNumber}`, games: 0, wins: [0, 0], draws: 0, history: [] };
+    }
+  }
   if (!room.series || room.series.roster !== roster || room.series.complete) {
     room.series = { roster, length: room.seriesLength || 0, games: 0, wins: {}, complete: false, champion: '' };
   }
 }
 
 export function recordNightResult(room) {
-  if (!room.winner || !room.matchId || room.nightRecordedMatch === room.matchId) return;
+  if (!room.winner || !room.matchId || room.nightRecordedMatch === room.matchId || room.nightRecordedMatches?.includes(room.matchId)) return;
   room.nightRecordedMatch = room.matchId;
+  (room.nightRecordedMatches ||= []).push(room.matchId);
   room.night = room.night || { games: 0, players: {} };
   room.night.games++;
   const handWins = room.trump?.handWins || {};
   const best = Math.max(0, ...Object.values(handWins));
   const team = room.trump?.winnerTeam;
+  const tally = room.gameType === 'trump' ? room.teamMatchTally : null;
+  if (tally) {
+    tally.games++;
+    const winnerTeam = room.winner === 'Draw' ? -1 : team;
+    if (winnerTeam === 0 || winnerTeam === 1) tally.wins[winnerTeam]++;
+    else tally.draws++;
+    tally.history.push({ matchId: room.matchId, gameNumber: tally.games, winner: room.winner, winnerTeam, teamScores: [...(room.trump?.scores || [0, 0])] });
+    tally.history = tally.history.slice(-20);
+  }
   for (const player of room.players) {
     const row = room.night.players[player.id] ||= { playerId: player.id, name: player.name, avatarIndex: player.avatarIndex, wins: 0, hands: 0, baap: 0, games: 0 };
     row.name = player.name; row.avatarIndex = player.avatarIndex; row.games++;
@@ -48,7 +65,9 @@ export function recordNightResult(room) {
 }
 
 export function gameNightState(room) {
+  const tally = room.gameType === 'trump' ? room.teamMatchTally : null;
   return {
+    teamMatchTally: tally ? { contestId: tally.contestId, games: tally.games, wins: [...tally.wins], draws: tally.draws, history: tally.history.map(row => ({ ...row, teamScores: [...row.teamScores] })) } : null,
     seriesLength: room.seriesLength || 0,
     series: room.series ? { length: room.series.length, games: room.series.games, wins: { ...room.series.wins }, complete: room.series.complete, champion: room.series.champion } : null,
     gameNight: { id: room.nightId || room.id, games: room.night?.games || 0, players: Object.values(room.night?.players || {}).map(p => ({ ...p })).sort((a, b) => b.wins - a.wins || b.baap - a.baap || b.hands - a.hands || a.name.localeCompare(b.name)) },
